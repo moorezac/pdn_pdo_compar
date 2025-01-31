@@ -1,0 +1,825 @@
+---
+title: "snrnaseq_process_seurat"
+author: "zm"
+date: "2024-10-29"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+EnvironmentModules::module_load("miniconda3")
+library(reticulate)
+reticulate::condaenv_exists("scvi")
+reticulate::use_condaenv("scvi")
+library(Seurat)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+conflicted::conflicts_prefer(tidyr::expand)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params_new.r"))
+```
+
+```{r ensembl}
+# import annotation
+# ensembl <- rtracklayer::import(
+#   con = here("meta/genome/Homo_sapiens.GRCh38.109.gtf.gz")
+# )
+# write_rds(
+#   x = ensembl,
+#   file = here("meta/ensembl.rds")
+# )
+ensembl <- read_rds(file = here("meta/ensembl.rds"))
+
+# gene only
+ensembl <- ensembl |>
+  as_tibble() |>
+  filter(type == "gene")
+```
+
+```{r numabt_res}
+numbat_results <- map(
+  .x = params$sample_groups |> unique(),
+  .f = function(x) {
+    library(numbat)
+    nb <- Numbat$new(out_dir = here("data/processed/SCRNA_240430_240621/numbat/out_final", x))
+
+    nb$clone_post |>
+      as_tibble() |>
+      rename(bc_wells = cell, numbat_res = compartment_opt) |>
+      mutate(line = x) |>
+      relocate(line)
+  }
+) |>
+  bind_rows()
+
+numbat_results <- numbat_results |>
+  mutate(
+    numbat_res = case_when(
+      p_cnv < 0.01 ~ "normal",
+      .default = "tumour"
+    )
+  )
+```
+
+```{r import}
+seurat_list <- map(
+  .progress = TRUE,
+  .x = params$sample_names,
+  .f = function(x) {
+    sample_dir <- here("data/processed/SCRNA_240430_240621", x, "DGE_filtered")
+    # pre-processed file does NOT have raw counts
+    mat <- fastMatMR::fmm_to_sparse_Matrix(
+      file = paste(sample_dir, "count_matrix.mtx", sep = "/")
+    ) |>
+      t()
+    gene_info <- read_csv(
+      file = paste(sample_dir, "all_genes.csv", sep = "/"),
+      show_col_types = FALSE
+    )
+    cell_meta <- read_csv(
+      file = paste(sample_dir, "cell_metadata.csv", sep = "/"),
+      show_col_types = FALSE
+    )
+
+    dimnames(mat) <- list(
+      gene_info$gene_id,
+      cell_meta$bc_wells
+    )
+
+    # collate
+    seurat_obj <- CreateSeuratObject(
+      counts = mat,
+      meta.data = cell_meta,
+      assay = "RNA"
+    )
+
+    seurat_obj$line <- str_sub(seurat_obj$sample, end = 6)
+    seurat_obj$type <- str_sub(seurat_obj$sample, start = 8)
+    seurat_obj$type <- case_when(
+      seurat_obj$type == "T" ~ "TIS",
+      .default = seurat_obj$type
+    )
+
+
+    # numbat
+    numbat <- tibble(bc_wells = seurat_obj$bc_wells) |>
+      left_join(y = numbat_results, by = "bc_wells")
+    seurat_obj$numbat_clone <- numbat$clone_opt
+    seurat_obj$numbat_compartment <- numbat$numbat_res
+    seurat_obj$numbat_p <- numbat$p_cnv
+
+    # add cycle scores
+    seurat_obj <- NormalizeData(seurat_obj)
+    seurat_obj <- CellCycleScoring(
+      seurat_obj,
+      s.features = ensembl |>
+        filter(gene_name %in% cc.genes$s.genes) |>
+        pull(gene_id),
+      g2m.features = ensembl |>
+        filter(gene_name %in% cc.genes$g2m.genes) |>
+        pull(gene_id),
+    )
+
+
+    # return
+    seurat_obj
+  }
+) |>
+  set_names(params$sample_names)
+
+# sort
+seurat_list <- seurat_list[sort(names(seurat_list))]
+```
+
+```{r mito}
+seurat_list <- map(
+  .x = seurat_list,
+  .f = function(x) {
+    x[["percent_mito"]] <- PercentageFeatureSet(
+      object = x,
+      features = ensembl |>
+        filter(seqnames == "MT") |>
+        pull(gene_id)
+    )
+    # threshold here
+    subset(x, subset = nFeature_RNA > 250 & percent_mito < 10)
+  }
+)
+```
+
+```{r merge}
+if(FALSE) {
+  seurat_line <- map(
+    .x = params$sample_groups |> unique(),
+    .f = function(x) {
+      seurat_obj <- merge(
+        x = seurat_list[names(seurat_list) |> str_starts(x)][[1]],
+        y = seurat_list[names(seurat_list) |> str_starts(x)][-1]
+      )
+      seurat_obj <- JoinLayers(seurat_obj)
+  
+      seurat_obj <- NormalizeData(seurat_obj)
+      seurat_obj <- FindVariableFeatures(object = seurat_obj, nfeatures = 5000)
+      seurat_obj <- ScaleData(object = seurat_obj)
+      seurat_obj <- RunPCA(object = seurat_obj)
+      seurat_obj <- FindNeighbors(object = seurat_obj, dims = 1:30)
+      seurat_obj <- FindClusters(object = seurat_obj)
+      seurat_obj <- RunUMAP(object = seurat_obj, dims = 1:30)
+  
+      seurat_obj
+    }
+  )
+  names(seurat_line) <- params$sample_groups |> unique()
+  
+  write_rds(
+    x = seurat_line,
+    file = here("data/intermed/seurat_line.rds")
+  )
+}
+seurat_line <- read_rds(file = here("data/intermed/seurat_line.rds"))
+
+seurat_all <- merge(x = seurat_list[[1]], y = seurat_list[-1])
+seurat_all_joined <- JoinLayers(seurat_all)
+```
+
+```{r singler}
+if (FALSE) {
+  source(file = here("eval/scripts/r/load_ref_list.r"))
+  reference_list <- load_ref_list()
+  rownames(reference_list$couturier) <- rowData(reference_list$couturier)$ID
+  seurat_couturier <- as.Seurat(reference_list$couturier)
+  seurat_couturier <- RenameAssays(
+    object = seurat_couturier,
+    assay.name = "originalexp",
+    new.assay.name = "RNA"
+  )
+
+  seurat_couturier <- NormalizeData(seurat_couturier)
+  # seurat_couturier <- FindVariableFeatures(seurat_couturier)
+
+  library(BiocParallel)
+  library(SingleR)
+  singler_results <- SingleR(
+    test = seurat_all_joined |> GetAssayData(),
+    ref = seurat_couturier |> GetAssayData(),
+    labels = seurat_couturier$cluster,
+    BPPARAM = BiocParallel::MulticoreParam(workers = 32)
+  )
+
+  write_rds(
+    x = singler_results,
+    file = here("meta/singler_results.rds")
+  )
+}
+singler_results <- read_rds(file = here("meta/singler_results.rds"))
+
+seurat_line <- map(
+  .x = seurat_line,
+  .f = function(x) {
+    x@meta.data <- left_join(
+      x = x@meta.data |> as_tibble(),
+      y = singler_results |> as_tibble(rownames = "bc_wells"),
+      by = "bc_wells"
+    ) |>
+      as.data.frame()
+    x
+  }
+)
+seurat_all@meta.data <- left_join(
+  x = seurat_all@meta.data |> as_tibble(),
+  y = singler_results |> as_tibble(rownames = "bc_wells"),
+  by = "bc_wells"
+) |>
+  as.data.frame()
+```
+
+```{r}
+if (FALSE) {
+  # seurat_normal <- seurat_all[, seurat_all$numbat_compartment == "normal"]
+  source(file = here("eval/scripts/r/load_ref_list.r"))
+  reference_list <- load_ref_list()
+
+  library(BiocParallel)
+  library(SingleCellExperiment)
+  library(SingleR)
+  singler_ruiz_results <- SingleR(
+    test = seurat_all_joined |> GetAssayData(),
+    ref = logcounts(reference_list$ruiz_moreno),
+    labels = reference_list$ruiz_moreno$annotation_level_3,
+    BPPARAM = BiocParallel::MulticoreParam(workers = 32)
+  )
+  singler_ruiz_results$pruned.labels |> table()
+
+  # what are neoplastic annotations in ref
+  neoplastic <- colData(reference_list$ruiz_moreno) |>
+    as_tibble() |>
+    filter(annotation_level_1 == "Neoplastic") |>
+    pull(annotation_level_3) |>
+    unique() |>
+    as.character()
+
+  # which cells were called as tumours
+  index_tumour <- which(singler_ruiz_results$pruned.labels %in% neoplastic)
+
+  next_non_neoplastic <- function(x) {
+    # assume vector input across rows
+    annotations <- colnames(singler_ruiz_results$scores)
+
+    `%notin%` <- Negate(f = `%in%`)
+
+    names(x) <- annotations
+
+    x1 <- sort(x, decreasing = TRUE)
+    names(x1[names(x1) %notin% neoplastic])[1]
+  }
+
+  new_label <- singler_ruiz_results$scores[index_tumour, ] |>
+    as_tibble() |>
+    rowwise() |>
+    summarise(new_label = next_non_neoplastic(c_across(everything()))) |>
+    pull(new_label)
+
+  singler_ruiz_results$next_normal <- singler_ruiz_results$pruned.labels
+  singler_ruiz_results$next_normal[index_tumour] <- new_label
+
+  write_rds(
+    x = singler_ruiz_results,
+    file = here("meta/singler_ruiz_results.rds")
+  )
+}
+
+singler_ruiz_results <- read_rds(file = here("meta/singler_ruiz_results.rds"))
+
+seurat_line <- map(
+  .x = seurat_line,
+  .f = function(x) {
+    x@meta.data <- left_join(
+      x = x@meta.data |> as_tibble(),
+      y = singler_ruiz_results |>
+        as_tibble(rownames = "bc_wells") |>
+        select(bc_wells, pruned.labels, next_normal) |>
+        dplyr::rename(pruned.labels.ruiz = pruned.labels, new_label.ruiz = next_normal),
+      by = "bc_wells"
+    ) |>
+      as.data.frame()
+    x
+  }
+)
+seurat_all@meta.data <- left_join(
+  x = seurat_all@meta.data |> as_tibble(),
+  y = singler_ruiz_results |>
+    as_tibble(rownames = "bc_wells") |>
+    select(bc_wells, pruned.labels, next_normal) |>
+    dplyr::rename(pruned.labels.ruiz = pruned.labels, new_label.ruiz = next_normal),
+  by = "bc_wells"
+) |>
+  as.data.frame()
+```
+
+```{r}
+seurat_line <- map(
+  .x = seurat_line,
+  .f = function(x) {
+    rownames(x@meta.data) <- x@meta.data$bc_wells
+    x
+  }
+)
+# final normal classification
+map(
+  .x = seurat_line,
+  .f = function(x) {
+    patchwork::wrap_plots(
+      UMAPPlot(x, group.by = "numbat_clone"),
+      UMAPPlot(x, group.by = "type"),
+      UMAPPlot(x, group.by = "seurat_clusters", label = TRUE)
+    )
+  }
+) |> 
+  patchwork::wrap_plots()
+
+individual_normal_clusters <- list(
+  GL0028 = 13,
+  GL0038 = c(5, 13),
+  GL0095 = c(4, 11, 15, 16, 17),
+  GL0128 = NULL
+)
+
+seurat_line <- imap(
+  .x = seurat_line,
+  .f = function(x, i) {
+    x$individual_normal_clusters <- case_when(
+      x$seurat_clusters %in% individual_normal_clusters[[i]] ~ "normal",
+      .default = NA
+    )
+    x
+  }
+)
+```
+
+```{r}
+seurat_all_joined <- merge(x = seurat_line[[1]], y = seurat_line[-1]) |> 
+  JoinLayers()
+
+seurat_all_joined <- NormalizeData(seurat_all_joined)
+seurat_all_joined <- FindVariableFeatures(object = seurat_all_joined, nfeatures = 5000)
+seurat_all_joined <- ScaleData(object = seurat_all_joined)
+seurat_all_joined <- RunPCA(object = seurat_all_joined)
+seurat_all_joined <- FindNeighbors(object = seurat_all_joined, dims = 1:30)
+seurat_all_joined <- FindClusters(object = seurat_all_joined)
+seurat_all_joined <- RunUMAP(object = seurat_all_joined, dims = 1:30)
+
+# seurat_all_joined@meta.data <- seurat_all@meta.data
+
+UMAPPlot(
+    seurat_all_joined,
+    group.by = c("numbat_clone", "type", "line", "seurat_clusters", "individual_normal_clusters"),
+    label = TRUE
+  )
+FeaturePlot(
+    seurat_all_joined,
+    features = c(
+      "ENSG00000081237", # ptprc
+      "ENSG00000197971", # mbp
+      "ENSG00000160307", # s100b
+      "ENSG00000167281" # rbfox3
+    )
+  )
+
+joined_normal_clusters <- c(7, 11, 16, 17)
+
+numbat_filtered <- case_when(
+  seurat_all_joined$seurat_clusters %in% joined_normal_clusters | 
+    seurat_all_joined$seurat_clusters %in% seurat_all_joined$individual_normal_clusters ~ TRUE,
+  .default = FALSE
+)
+seurat_all_joined$numbat_filtered <- numbat_filtered
+seurat_all$numbat_filtered <- numbat_filtered
+
+# UMAPPlot(
+#     seurat_all_joined,
+#     group.by = c("numbat_clone", "type", "line", "seurat_clusters"),
+#     label = TRUE,
+#     dims = c(1, 2)
+#   )
+# seurat_all$normal_annotation <- case_when(
+#     seurat_all_joined$seurat_clusters == 19 ~ "Immune",
+#   .default = seurat_all$normal_annotation
+# ) |>
+#   base::unname()
+```
+
+```{r save}
+seurat_all_joined_filtered <- seurat_all_joined[VariableFeatures(seurat_all_joined), ]
+seurat_all_joined_filtered <-
+  seurat_all_joined_filtered[, !(seurat_all_joined_filtered$line %in% "GL0128")]
+seurat_all_joined_filtered@meta.data <- left_join(
+  x = seurat_all_joined_filtered@meta.data |> as_tibble(rownames = "rowname"),
+  y = seurat_all@meta.data |> column_to_rownames(var = "bc_wells") |> as_tibble(rownames = "rowname")
+) |>
+  column_to_rownames()
+
+seurat_all_joined_filtered_tumour <-
+  seurat_all_joined_filtered[, !(seurat_all_joined_filtered$numbat_filtered)]
+
+library(scCustomize)
+try({
+  scCustomize::as.anndata(
+    x = seurat_all_joined_filtered,
+    file_path = here("data/intermed/"),
+    main_layer = "data",
+    transer_dimreduc = TRUE,
+    file_name = "1_seurat_all_anndata.h5ad"
+  )
+})
+try({
+  scCustomize::as.anndata(
+    x = seurat_all_joined_filtered_tumour,
+    file_path = here("data/intermed/"),
+    main_layer = "data",
+    transer_dimreduc = TRUE,
+    file_name = "1_seurat_all_tumour_anndata.h5ad"
+  )
+})
+```
+
+```{r}
+seurat_all_joined_tumour <- seurat_all_joined
+seurat_all_joined_tumour <-
+  seurat_all_joined_tumour[, !(seurat_all_joined_tumour$line %in% "GL0128")]
+# seurat_all_joined_tumour@meta.data <- left_join(
+#   x = seurat_all_joined_tumour@meta.data |> as_tibble(rownames = "rowname"),
+#   y = seurat_all@meta.data |> column_to_rownames(var = "bc_wells") |> as_tibble(rownames = "rowname")
+# ) |>
+#   column_to_rownames()
+
+seurat_all_joined_tumour <-
+  seurat_all_joined_tumour[, !(seurat_all_joined_tumour$numbat_filtered)]
+```
+
+```{r}
+# new anno on mde
+# tumour only
+if (FALSE) {
+  integrated <- zellkonverter::readH5AD(
+    file = here("data/intermed/snrnaseq/scvi_all_integrated_tumour.h5ad")
+  )
+  source(file = here("eval/scripts/r/load_ref_list.r"))
+  reference_list <- load_ref_list()
+  library(SingleCellExperiment)
+  rownames(reference_list$couturier) <- rowData(reference_list$couturier)$ID
+  seurat_couturier <- as.Seurat(reference_list$couturier)
+  seurat_couturier <- RenameAssays(
+    object = seurat_couturier,
+    assay.name = "originalexp",
+    new.assay.name = "RNA"
+  )
+
+  seurat_couturier <- NormalizeData(seurat_couturier)
+  seurat_couturier <- FindVariableFeatures(seurat_couturier)
+
+  seurat_all_joined_tumour |> dim()
+  seurat_couturier |> dim()
+  
+  library(BiocParallel)
+  library(SingleR)
+  singler_tumour_mde_results <- SingleR(
+    test = seurat_all_joined_tumour |> GetAssayData(),
+    ref = seurat_couturier |> GetAssayData(),
+    labels = seurat_couturier$cluster,
+    clusters = integrated$leiden,
+    restrict = intersect(
+      VariableFeatures(seurat_all_joined_tumour),
+      VariableFeatures(seurat_couturier)
+    ),
+    BPPARAM = BiocParallel::MulticoreParam(workers = 32)
+  )
+  write_rds(
+    x = singler_tumour_mde_results,
+    file = here("meta/singler_tumour_mde_results.rds")
+  )
+}
+singler_tumour_mde_results <- read_rds(
+    file = here("meta/singler_tumour_mde_results.rds")
+  )
+integrated <- zellkonverter::readH5AD(
+    file = here("data/intermed/snrnaseq/scvi_all_integrated_tumour.h5ad")
+  )
+
+# singler_tumour_mde_results$pruned.labels
+# 
+# rownames(integrated) <- rowData(integrated)$var.features
+# integrated <- scater::logNormCounts(integrated, assay.type = "counts")
+# 
+# 
+# seurat_test <- seurat_all_joined_tumour
+seurat_all_joined_tumour$leiden <- integrated$leiden
+# 
+new_labels <- singler_tumour_mde_results$pruned.labels |>
+  set_names(1:length(singler_tumour_mde_results$pruned.labels) - 1)
+
+seurat_all_joined_tumour$mde_annotation <- seurat_all_joined_tumour$leiden |>
+  as_tibble_col(column_name = "leiden") |>
+  left_join(enframe(new_labels, name = "leiden", value = "mde_annotation")) |>
+  pull(mde_annotation)
+```
+
+```{r}
+seurat_all_joined_tumour_regressed <- seurat_all_joined_tumour
+seurat_all_joined_tumour_regressed <- NormalizeData(seurat_all_joined_tumour_regressed)
+seurat_all_joined_tumour_regressed <- FindVariableFeatures(
+  object = seurat_all_joined_tumour_regressed,
+  nfeatures = 5000
+)
+seurat_all_joined_tumour_regressed <- ScaleData(
+  object = seurat_all_joined_tumour_regressed,
+  vars.to.regress = c("S.Score", "G2M.Score")
+)
+seurat_all_joined_tumour_regressed <- RunPCA(object = seurat_all_joined_tumour_regressed)
+seurat_all_joined_tumour_regressed <- FindNeighbors(object = seurat_all_joined_tumour_regressed, dims = 1:30)
+seurat_all_joined_tumour_regressed <- FindClusters(object = seurat_all_joined_tumour_regressed)
+seurat_all_joined_tumour_regressed <- RunUMAP(object = seurat_all_joined_tumour_regressed, dims = 1:30)
+
+UMAPPlot(seurat_all_joined_tumour_regressed, group.by = c("seurat_clusters", "line", "type", "labels", "numbat_filtered"))
+```
+
+```{r}
+pseudo_list <- list(
+  pseudo_broad = AggregateExpression(
+    seurat_all_joined_tumour,
+    assays = "RNA",
+    return.seurat = TRUE,
+    group.by = c("line", "type")
+  ),
+  pseudo_label_regressed = AggregateExpression(
+    seurat_all_joined_tumour_regressed,
+    assays = "RNA",
+    return.seurat = TRUE,
+    group.by = c("line", "type", "mde_annotation")
+  )
+)
+```
+
+```{r broad}
+broad_de_list <- map2(
+  .x = c("PDN", "PDO", "PDN"),
+  .y = c("TIS", "TIS", "PDO"),
+  .f = function(x, y) {
+    Idents(pseudo_list$pseudo_broad) <- "type"
+
+    FindMarkers(
+      object = pseudo_list$pseudo_broad,
+      ident.1 = x,
+      ident.2 = y,
+      test.use = "DESeq2"
+    )
+  }
+) |>
+  set_names(c("PDN_TIS", "PDO_TIS", "PDN_PDO"))
+
+msigdb_hallmark <- msigdbr::msigdbr(
+  category = "H"
+)
+msigdb_hallmark_list <- unique(msigdb_hallmark$gs_name) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      msigdb_hallmark |>
+        filter(gs_name == x) |>
+        pull(gene_symbol)
+    }
+  )
+
+broad_de_fgsea <- map(
+  .x = broad_de_list,
+  .f = function(x) {
+    fgsea::fgsea(
+      pathways = msigdb_hallmark_list,
+      stats = x |>
+        as_tibble(rownames = "gene_id") |>
+        left_join(ensembl) |>
+        mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+        select(gene_name, rank) |>
+        arrange(rank) |>
+        drop_na() |>
+        deframe()
+    )
+  }
+)
+library(enrichR)
+broad_de_enrich <- map(
+  .x = broad_de_list,
+  .f = function(x) {
+    list(
+      up = enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC > 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+      ),
+      down = enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC < 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+    )
+    )
+  }
+)
+```
+
+```{r labels}
+pseudo_list$pseudo_label_regressed$test <- paste(
+  pseudo_list$pseudo_label_regressed$type,
+  pseudo_list$pseudo_label_regressed$mde_annotation,
+  sep = "_"
+)
+
+cross_test <- crossing(
+  x = pseudo_list$pseudo_label_regressed$test,
+  y = pseudo_list$pseudo_label_regressed$test
+) |>
+  filter(x < y) |>
+  mutate(
+    match = map2_lgl(
+      .x = x,
+      .y = y,
+      .f = function(x, y) {
+        str_split(x, pattern = "_")[[1]][[2]] == str_split(y, pattern = "_")[[1]][[2]]
+      }
+    )
+  ) |>
+  filter(match)
+
+# some samples have unassigned, some don't
+cross_test <- cross_test |> 
+  filter(!str_detect(x, "Un"))
+
+label_de_list <- map2(
+  .progress = TRUE,
+  .x = cross_test$x,
+  .y = cross_test$y,
+  .f = function(x, y) {
+    Idents(pseudo_list$pseudo_label_regressed) <- "test"
+
+    try({
+      FindMarkers(
+      object = pseudo_list$pseudo_label_regressed,
+      ident.1 = x,
+      ident.2 = y,
+      # for unassigned
+      min.cells.group = 1,
+      test.use = "DESeq2"
+    )
+    })
+  }
+) |> 
+  set_names(paste(cross_test$x, cross_test$y, sep = "_"))
+
+label_de_fgsea <- map(
+  .progress = TRUE,
+  .x = label_de_list,
+  .f = function(x) {
+    try({
+      fgsea::fgsea(
+      pathways = msigdb_hallmark_list,
+      stats = x |>
+        as_tibble(rownames = "gene_id") |>
+        left_join(ensembl) |>
+        mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+        select(gene_name, rank) |>
+        arrange(rank) |>
+        drop_na() |>
+        deframe()
+    )
+    })
+  }
+)
+
+library(enrichR)
+label_de_enrich <- map(
+  .x = label_de_list,
+  .f = function(x) {
+    list(
+      up = try({
+        enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC > 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+      )
+        }),
+      down = try({
+      enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC < 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+      )
+      })
+    )
+  }
+)
+```
+
+```{r}
+label_alone_de_list <- map(
+  .progress = TRUE,
+  .x = pseudo_list$pseudo_label_regressed$mde_annotation |> unique(),
+  .f = function(x, y) {
+    Idents(pseudo_list$pseudo_label_regressed) <- "mde_annotation"
+
+    FindMarkers(
+      object = pseudo_list$pseudo_label_regressed,
+      ident.1 = x,
+      # for unassigned
+      min.cells.group = 2,
+      test.use = "DESeq2"
+    )
+  }
+) |> 
+  set_names(pseudo_list$pseudo_label_regressed$mde_annotation |> unique())
+
+label_alone_de_enrich <- map(
+  .x = label_alone_de_list,
+  .f = function(x) {
+    list(
+      up = try({
+        enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC > 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+      )
+        }),
+      down = try({
+      enrichR::enrichr(
+        genes = x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(ensembl) |>
+          filter(p_val_adj < 0.05) |>
+          filter(avg_log2FC < 0) |>
+          pull(gene_name),
+        databases = c(
+          "GO_Molecular_Function_2018",
+          "KEGG_2013",
+          "Reactome_2013"
+        )
+      )
+      })
+    )
+  }
+)
+```
+
+```{r}
+save.image(file = here("data/intermed/workspace.rds"))
+```
