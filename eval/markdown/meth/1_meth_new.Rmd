@@ -1,0 +1,798 @@
+---
+title: "1_meth_new"
+author: "zm"
+date: "2024-10-31"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(minfi)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params_new.r"))
+```
+
+```{r annotation}
+anno <- minfi::getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+```
+
+```{r targets}
+targets <- read.metharray.sheet(
+  base = here("data", "raw", "MTH_240801"),
+  pattern = "SampleSheet"
+)
+targets$line <- str_sub(targets$Sample_Name, end = 6)
+targets$type <- str_sub(targets$Sample_Name, start = 8)
+```
+
+```{r read}
+rgset <- read.metharray.exp(targets = targets)
+sampleNames(rgset) <- targets$Sample_Name
+```
+
+```{r detected}
+detected_p <- detectionP(rgset)
+stopifnot(all(colMeans(detected_p) < 0.05))
+```
+
+```{r raw_proc}
+mset_raw <- preprocessRaw(rgSet = rgset)
+mset_proc <- preprocessSWAN(rgSet = rgset)
+```
+
+```{r drop_probes}
+# those that are detected
+detected_p <- detected_p[match(featureNames(mset_proc), rownames(detected_p)), ]
+
+keep_detected <- rowSums(detected_p < 0.01) == ncol(mset_proc)
+table(keep_detected)
+
+# those notin sex chromosomes
+`%notin%` <- Negate(f = `%in%`)
+keep_sex <- anno$chr %notin% c("chrX", "chrY") |> set_names(anno$Name)
+table(keep_sex)
+
+# those that are cross reactive on 450k
+drop_450k <- read_csv(
+  file = here("meta/450k_filter/48639-non-specific-probes-Illumina450k.csv"),
+  show_col_types = FALSE
+) |>
+  pull(1)
+
+# those that are cross reactive on epic
+drop_epic <- map(
+  .x = c(1, 4, 5, 6),
+  .f = function(x) {
+    read_csv(
+      file = here(
+        "meta/450k_filter/EPIC",
+        paste0("13059_2016_1066_MOESM", x, "_ESM.csv")
+      ),
+      show_col_types = FALSE
+    ) |>
+      pull(1)
+  }
+) |>
+  purrr::reduce(.f = base::c) |>
+  unique()
+
+# create filtered obj. here
+mset_filt <- mset_proc[keep_detected | keep_sex, ]
+mset_filt <- mset_filt[str_sub(string = rownames(mset_filt), end = -6) %notin% c(drop_450k, drop_epic), ]
+
+# those without snps
+mset_filt <- minfi::mapToGenome(object = mset_filt)
+mset_filt <- minfi::dropLociWithSnps(object = mset_filt)
+mset_filt
+```
+
+```{r mds}
+mds_plots <- map(
+  .x = list(mset_proc, mset_filt),
+  .f = function(x) {
+    plot_m_mds <- x |>
+      getM() |>
+      limma::plotMDS(
+        top = 1000,
+        gene.selection = "common"
+      )
+    plot_m_mds <- plot_m_mds$eigen.vectors |>
+      as_tibble() |>
+      bind_cols(sample = mset_filt$Sample_Name) |>
+      mutate(
+        line = str_sub(sample, end = 6),
+        type = str_sub(sample, start = 8)
+      ) |>
+      mutate(MDS_1 = V1, MDS_2 = V2, Sample = type, Line = line) |>
+      mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+      ggplot(
+        mapping = aes(
+          x = MDS_1,
+          y = MDS_2,
+          colour = Line,
+          fill = Line,
+          shape = Sample
+        )
+      ) +
+      ggforce::geom_mark_ellipse(
+        mapping = aes(
+          group = Line
+        ),
+        expand = unit(0, "mm")
+      ) +
+      geom_point(size = 5) +
+      geom_point(key_glyph = draw_key_rect) +
+      geom_point() +
+      scale_colour_manual(values = params$line_colours) +
+      scale_fill_manual(values = params$line_colours) +
+      scale_shape_manual(values = params$type_shapes) +
+      xlab(paste0("MDS_1\n", round(plot_m_mds$var.explained[1] * 100, 2), "% Variance Explained")) +
+      ylab(paste0("MDS_1\n", round(plot_m_mds$var.explained[2] * 100, 2), "% Variance Explained")) +
+      guides(
+        colour = guide_legend(title = "Line"),
+        shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+      ) +
+      theme(
+        aspect.ratio = 1,
+        axis.ticks = element_line(colour = "black"),
+        axis.text = element_blank(),
+        panel.grid.major = element_line(colour = "grey90"),
+        panel.grid.minor = element_line(colour = "grey90"),
+        panel.background = element_rect(fill = "white", colour = "black")
+      )
+  }
+)
+mds_plots[[2]] + ggh4x::force_panelsizes(
+  rows = unit(7.5, "cm"),
+  cols = unit(7.5, "cm")
+)
+```
+
+```{r dmrcate}
+library(DMRcate)
+
+m_vals <- getM(mset_filt) |>
+  rmSNPandCH() |>
+  rmPosReps(filter.strategy = "mean")
+
+design_full <- model.matrix(
+  ~ type + line,
+  data = targets |> mutate(
+    type = factor(type, levels = c("T", "PDN", "PDO")),
+    line = line
+  )
+)
+# design_type <- model.matrix(~ 0 + type, data = targets)
+colnames(design_full) <- make.names(colnames(design_full))
+# colnames(design_type) <- make.names(colnames(design_type))
+colnames(design_full)
+
+fit_full <- limma::lmFit(m_vals, design_full)
+# fit_type <- limma::lmFit(m_vals, design_type)
+
+contrast_matrix_full <- limma::makeContrasts(
+  typePDN,
+  typePDO,
+  # typePDN - typePDO,
+  levels = design_full
+)
+# contrast_matrix_type <- limma::makeContrasts(
+#   typePDN - typeT,
+#   typePDO - typeT,
+#   typePDN - typePDO,
+#   levels = design_type
+# )
+
+fit_contrasts_full <- limma::contrasts.fit(
+  fit = fit_full,
+  contrasts = contrast_matrix_full
+) |>
+  limma::eBayes()
+# fit_contrasts_type <- limma::contrasts.fit(
+#   fit = fit_type,
+#   contrasts = contrast_matrix_type
+# ) |>
+#   limma::eBayes()
+
+limma::decideTests(fit_contrasts_full, method = "global") |>
+  as.data.frame() |>
+  as_tibble(rownames = "probe")
+
+summary(limma::decideTests(fit_contrasts_full, method = "global"))
+# summary(limma::decideTests(fit_contrasts_type, method = "separate"))
+
+limma::topTable(fit_contrasts_full, number = Inf, adjust.method = "BH", coef = 1)
+up_lfc <- x |>
+  filter(lfc_mean > 2) |>
+  pull(gene_name)
+down_lfc <- x |>
+  filter(lfc_mean < -2) |>
+  pull(gene_name)
+
+volcano_probes <- map(
+  .x = 1:2,
+  .f = function(x) {
+    library(ggtext)
+    if (x == 1) {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDN</span>"
+      title_down <- "<span style='color:#4F7EBB;'>Up in TIS</span>"
+    } else if (x == 2) {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDO</span>"
+      title_down <- "<span style='color:#4F7EBB;'>Up in TIS</span>"
+    } else if (x == 3) {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDN</span>"
+      title_down <- "<span style='color:#4F7EBB;'>Up in PDO </span>"
+    }
+
+    dat <- limma::topTable(fit_contrasts_full, number = Inf, adjust.method = "BH", coef = x) |>
+      as_tibble(rownames = "probe") |>
+      mutate(
+        up_lfc = logFC > log2(2),
+        down_lfc = logFC < log2(2),
+        is_de_fdr_0.05 = adj.P.Val < 0.05
+      )
+
+    sig <- limma::decideTests(fit_contrasts_full, method = "global") |>
+      as.data.frame() |>
+      as_tibble(rownames = "probe") |>
+      select(c(1, x + 1))
+    sig_index <- which(sig[, 2] == 1 | sig[, 2] == -1)
+    sig_probes <- sig$probe[sig_index]
+
+    dat <- dat |>
+      mutate(
+        is_sig = case_when(
+          probe %in% sig_probes ~ TRUE
+        )
+      ) |>
+      mutate(
+        sig = case_when(
+          up_lfc == TRUE & is_sig == TRUE ~ "up_sig",
+          down_lfc == TRUE & is_sig == TRUE ~ "down_sig"
+        )
+      ) |>
+      mutate(
+        colour_point = case_when(
+          sig == "up_sig" ~ "#BC3D41",
+          sig == "down_sig" ~ "#4F7EBB",
+          .default = "grey"
+        )
+      ) |>
+      mutate(
+        label_point = case_when(
+          probe %in% sig ~ probe,
+          .default = NA_character_
+        )
+      )
+
+    # mutate(adj = stats::p.adjust(P.Value, method = ""))
+    dat |> ggplot(
+      mapping = aes(
+        x = logFC,
+        y = B,
+        # y = -log10(P.Value),
+        colour = colour_point,
+        label = label_point,
+      )
+    ) +
+      geom_point(pch = ".") +
+      scale_colour_identity() +
+      labs(
+        y = "log-odds",
+        x = expression("log"[2] * "FC")
+      ) +
+      theme(
+        aspect.ratio = 1,
+        panel.background = element_rect(fill = NA, colour = "black"),
+        panel.grid = element_line(colour = "grey90"),
+        # plot.title = element_text(hjust = 0.5)
+        plot.title = ggtext::element_markdown(hjust = 0.5)
+      ) +
+      geom_hline(
+        yintercept = dat |> filter(is_sig == TRUE) |> pull(B) |> min(),
+        linetype = "dashed"
+      ) +
+      geom_vline(
+        xintercept = c(-1, 1),
+        linetype = "dashed"
+      ) +
+      coord_fixed(clip = "off") +
+      annotate(
+        label = title_up,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 1
+      ) +
+      annotate(
+        label = title_down,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = -Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 0
+      ) +
+      labs(title = "", subtitle = "")
+  }
+)
+patchwork::wrap_plots(
+  mds_plots[[2]],
+  patchwork::wrap_plots(
+    volcano_probes[[1]], volcano_probes[[2]],
+    ncol = 1
+  )
+)
+
+limma::topTable(fit_contrasts_full, number = Inf, adjust.method = "BH", coef = x) |>
+  as_tibble(rownames = "probe") |>
+  select(probe, P.Value) |>
+  deframe()
+
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+full_anno <- methylGSA::prepareAnnot()
+methylGSA::methylglm(
+  cpg.pval = limma::topTable(fit_contrasts_full, number = Inf, adjust.method = "BH", coef = x) |>
+    as_tibble(rownames = "probe") |>
+    select(probe, P.Value) |>
+    deframe(),
+  array.type = "EPIC"
+)
+
+library(sesame)
+sesameDataCache()
+
+query <- KYCG_getDBs("MM285.designGroup")[["PGCMeth"]]
+head(query)
+
+dmr_res_type <- c("typePDN", "typePDO") |>
+  set_names() |>
+  map(
+    .progress = TRUE,
+    # coefs
+    .f = function(x) {
+      dmrcate_anno <- cpg.annotate(
+        datatype = "array",
+        object = m_vals,
+        what = "M",
+        arraytype = "EPICv2",
+        epicv2Remap = TRUE,
+        analysis.type = "differential",
+        design = design_full,
+        contrasts = TRUE,
+        cont.matrix = contrast_matrix_full,
+        coef = x,
+        fdr = 0.05
+      )
+
+      dmrcate_output <- try({
+        dmrcate(
+          object = dmrcate_anno,
+          lambda = 1000,
+          C = 2
+        )
+      })
+
+      if (class(dmrcate_output) == "try-error") {
+        return(
+          list(
+            anno = dmrcate_anno,
+            output = NA,
+            ranges = NA
+          )
+        )
+      }
+
+      dmrcate_ranges <- extractRanges(
+        dmrcoutput = dmrcate_output,
+        genome = "hg38"
+      )
+
+      list(
+        anno = dmrcate_anno,
+        output = dmrcate_output,
+        ranges = dmrcate_ranges
+      )
+    }
+  )
+
+cols <- myColors[as.character(variable.of.choice)]
+DMR.plot(
+  ranges = dmr_res_type$typePDN$ranges,
+  dmr = 1,
+  CpGs = getBeta(mset_filt),
+  what = "Beta",
+  arraytype = "EPICv2",
+  phen.col = c("red", "green", "blue") |> set_names("T", "PDN", "PDO") |> rep(3),
+  genome = "hg38",
+  heatmap = FALSE
+)
+```
+
+```{r}
+library(BiocParallel)
+library(sesame)
+library(SummarizedExperiment)
+
+betas <- openSesame(
+  x = searchIDATprefixes(here("data", "raw", "MTH_240801")),
+  prep = "QCDPB",
+  BPPARAM = BiocParallel::MulticoreParam(40)
+)
+
+sheet <- read_csv(
+  file = here("data/raw/MTH_240801/CAGRF24050433-1_SampleSheet.csv"),
+  skip = 7,
+  show_col_types = FALSE
+) |> 
+  rename_with(.fn = snakecase::to_snake_case) |> 
+  mutate(uid = paste(sentrix_id, sentrix_position, sep = "_"))
+
+sheet <- as_tibble_col(colnames(betas), column_name = "uid") |> 
+  left_join(sheet, by = join_by(uid))
+
+stopifnot(all(colnames(betas) == sheet$uid))
+
+se <- SummarizedExperiment(
+  assays = list(betas = betas),
+  colData = sheet |> 
+    mutate(
+      line = str_sub(sample_name, end = 6) |> as_factor(),
+      type = str_sub(sample_name, start = 8) |> as_factor()
+    ) |>
+    column_to_rownames(var = "uid")
+)
+
+se_ok <- {
+  checkLevels(
+    betas = assay(se),
+    fc = colData(se)$line
+  ) &
+    checkLevels(
+      betas = assay(se),
+      fc = colData(se)$type
+    )
+}
+table(se_ok)
+
+se <- se[se_ok, ]
+
+colData(se)$type <- relevel(factor(colData(se)$type), "T")
+
+library(tictoc)
+
+tic()
+smry <- DML(
+  betas = se,
+  fm = ~ line + type,
+  BPPARAM = BiocParallel::MulticoreParam(workers = 50)
+)
+toc()
+
+test_result <- summaryExtractTest(smry)
+colnames(test_result)
+
+merged_pdn <- DMR(betas = se, smry = smry, contrast = "typePDN", seg.per.locus = 0.05, platform = "EPICv2")
+merged_pdo <- DMR(betas = se, smry = smry, contrast = "typePDO", seg.per.locus = 0.05, platform = "EPICv2")
+
+merged_pdn |>
+  arrange(Seg_Pval_adj) |> 
+  distinct(Seg_Start, Seg_End, .keep_all = TRUE) %>% 
+  {
+    visualizeRegion(
+      chrm = .$Seg_Chrm[2],
+      beg = .$Seg_Start[2],
+      end = .$Seg_End[2],
+      betas = betas,
+      platform = "EPICv2",
+      genome = "hg38"
+    )
+  }
+
+betas_plot <- betas
+colnames(betas_plot) <- se$sample_name
+betas_plot <- betas_plot[, colnames(betas_plot) |> sort()]
+colnames(betas_plot) <- str_replace(string = colnames(betas_plot), pattern = "T", replacement = "TIS")
+
+merged_pdn |>
+  arrange(Seg_Pval_adj) |> 
+  distinct(Seg_Start, Seg_End, .keep_all = TRUE) %>% 
+  {
+    visualizeRegion(
+      chrm = .$Seg_Chrm[2],
+      beg = .$Seg_Start[2],
+      end = .$Seg_End[2],
+      betas = betas_plot[complete.cases(betas_plot), ],
+      platform = "EPICv2",
+      na.rm = TRUE,
+      genome = "hg38",
+      cluster.samples = FALSE,
+      show.probeNames = FALSE
+    )
+  }
+cairo_pdf(
+  file = here("output/meth/plots/hox.pdf"),
+  width = 17.5/2.54,
+  height = 10/2.54
+)
+merged_pdn |>
+  arrange(Seg_Pval_adj) |> 
+  distinct(Seg_Start, Seg_End, .keep_all = TRUE) %>% 
+  {
+    visualizeRegion(
+      chrm = .$Seg_Chrm[2],
+      beg = .$Seg_Start[2],
+      end = .$Seg_End[2],
+      betas = betas_plot[complete.cases(betas_plot), ],
+      platform = "EPICv2",
+      na.rm = TRUE,
+      genome = "hg38",
+      cluster.samples = FALSE,
+      show.probeNames = FALSE
+    )
+  }
+dev.off()
+
+query_pdn <- test_result |> 
+  filter(Pval_typePDN < 0.01) |> 
+  pull(Probe_ID)
+query_pdo <- test_result |> 
+  filter(Pval_typePDO < 0.01) |> 
+  pull(Probe_ID)
+  # mutate(adjust = p.adjust(Pval_typePDN, method = "BH")) |> 
+  # filter(adjust < 0.05)
+regs <- sesameData_getTxnGRanges("hg38", merge2gene = TRUE)
+genes_pdn <- sesameData_annoProbes(query_pdn, regs, platform = "EPICv2", return_ov_features=TRUE)
+genes_pdo <- sesameData_annoProbes(query_pdo, regs, platform = "EPICv2", return_ov_features=TRUE)
+
+library(gprofiler2)
+## use gene name
+gostres_pdn <- gost(
+  genes_pdn$gene_name, 
+  organism = "hsapiens",
+  measure_underrepresentation = TRUE,
+  correction_method = "fdr"
+  )
+gostres_pdo <- gost(
+  genes_pdo$gene_name, 
+  organism = "hsapiens",
+  measure_underrepresentation = TRUE,
+  correction_method = "fdr"
+  )
+
+a <- gostres_pdn$result |> 
+  arrange(p_value) |> 
+  filter(source == "GO:BP") |> 
+  slice(1:20)
+b <- gostres_pdo$result |> 
+  arrange(p_value) |> 
+  filter(source == "GO:BP") |> 
+  slice(1:20)
+# a$term_id %in% b$term_id |> table()
+c <- bind_rows(
+  a |> mutate(sample = "PDN vs. TIS"),
+  b |> mutate(sample = "PDO vs. TIS")
+)
+
+c$term_name |> 
+  nchar()
+
+c |> 
+  mutate(
+    term_name = case_when(
+      nchar(term_name) > 10 ~ paste0(str_sub(term_name,1,27), "..."),
+      .default = term_name
+    ),
+    # term_name = str_sub(term_name, 1, 40)
+  ) |> 
+  ggplot(
+   mapping = aes(
+    x = sample, 
+    y = term_name,
+    fill = -log10(p_value)
+   ) 
+  ) + 
+  geom_tile(colour = "black") + 
+  scale_fill_viridis_c() + 
+  guides(fill = guide_colorbar(title = "-log10(p)")) + 
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 45)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(
+    legend.title = element_text(size = 8),
+    legend.key.height = unit(2.5/6, "cm"),
+    axis.title = element_blank(),
+    text = element_text(size = 10),
+    panel.background = element_rect(fill = "white", colour = "black", linewidth = 0.5)
+  ) + 
+  ggh4x::force_panelsizes(
+    rows = unit(5, "cm"),
+    cols = unit(1,  "cm")
+  )
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/meth/plots/gsea.pdf"),
+  width = 20,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/meth/plots/gsea.pdf"),
+    here("output/meth/plots/gsea.pdf")
+  ),
+  stdout = NULL
+)
+
+# gostres_pdn$result |> 
+#   as_tibble() |> View()
+# gostres_pdo$result |> 
+#   as_tibble() |> View()
+
+# gostplot(gostres_pdn)
+
+test_result |>
+  # mutate(adjust = p.adjust(Pval_typePDN, method = "BH")) |>
+  ggplot(
+    mapping = aes(
+      x = Est_typePDN,
+      y = -log10(Pval_typePDN)
+    )
+  ) +
+  geom_point(pch = ".")
+
+library(wheatmap)
+a <- visualizeRegion(
+  chrm = "chr10",
+  beg = 129467190 - 1000,
+  end = 129467190 + 500,
+  betas = betas_plot[complete.cases(betas_plot), ],
+  platform = "EPICv2",
+  show.probeNames = FALSE,
+  genome = "hg38"
+)
+a$children[[4]] <- NULL
+ 
+a[["children"]][[1]][["glist"]][[1]][["gp"]][["fontsize"]] <- 8
+a[["children"]][[1]][["glist"]][[6]][["gp"]][["fontsize"]] <- 8
+a + 
+  wheatmap::WLegendV(
+    'betas',
+    wheatmap::RightOf('betas', pad=0.05), 
+    yticklabel.side='r', 
+    n.stops = 1000,
+    n.text = 2,
+    label.fontsize = 8,
+    decreasing = TRUE
+    )
+# dev.copy(
+#   device = png,
+#   here("output/meth/plots/mgmt.png"), 
+#   width = 20,
+#   height = 7.5,
+#   units = "cm",
+#   res = 300
+#   );
+# dev.off()
+cairo_pdf(
+  file = here("output/meth/plots/mgmt.pdf"),
+  width = 13/2.54,
+  height = 7.5/2.54
+)
+a + 
+  wheatmap::WLegendV(
+    'betas',
+    wheatmap::RightOf('betas', pad=0.05), 
+    yticklabel.side='r', 
+    n.stops = 1000,
+    n.text = 2,
+    label.fontsize = 10,
+    decreasing = TRUE
+    )
+dev.off()
+# ggsave(
+#   filename = here("output/meth/plots/mgmt.pdf"),
+#   width = 13,
+#   height = 6.5,
+#   units = "cm"
+# )
+
+mds_plots <- readRDS("/vast/scratch/users/moore.z/pdo_compar/mds_plots.rds")
+
+mds_plots[[2]] + 
+  ggh4x::force_panelsizes(rows = unit(5.5, "cm"), cols = unit(5.5, "cm"))
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/meth/plots/mds.pdf"),
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/meth/plots/mds.pdf"),
+    here("output/meth/plots/mds.pdf")
+  ),
+  stdout = NULL
+)
+
+visualizeGene(
+  "MGMT",
+  betas_plot,
+  platform = "EPICv2",
+  genome = "hg38",
+  upstream = 0,
+  na.rm = TRUE,
+  # cluster.samples = TRUE,
+  dwstream = 5000
+)
+
+visualizeRegion(
+  chrm = "chr10",
+  beg = 129467190 - 1000,
+  end = 129467190 + 500,
+  betas = betas_plot[complete.cases(betas_plot), ],
+  platform = "EPICv2",
+  show.probeNames = FALSE,
+  genome = "hg38"
+)
+
+
+
+# 
+# query <- KYCG_getDBs("MM285.designGroup")[["PGCMeth"]]
+# 
+# cd <- as.data.frame(colData(se))
+# rownames(cd) <- NULL
+# cd
+# 
+# se_ok <- (checkLevels(assay(se), colData(se)$sex) &
+#   checkLevels(assay(se), colData(se)$tissue))
+# sum(se_ok)
+# 
+# sesameDataG
+# qc <- sesameQC_calcStats(betas, c("detection"))
+# 
+# as.data.frame(colData(se))
+# rownames(cd) <- NULL
+```
+
+```{r}
+merged_pdn |> 
+  group_by(Seg_ID) |> 
+  mutate(n = n()) |> 
+  filter(!is.nan(Seg_Pval_adj)) |> 
+  filter(n > 20, Seg_Pval_adj < 0.05) |> 
+  distinct(Seg_ID)
+
+merged_pdo |> 
+  group_by(Seg_ID) |> 
+  mutate(n = n()) |> 
+  filter(!is.nan(Seg_Pval_adj)) |> 
+  filter(n > 20, Seg_Pval_adj < 0.05) |> 
+  distinct(Seg_ID)
+```

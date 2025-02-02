@@ -1,0 +1,1583 @@
+---
+title: "2_annotation"
+author: "zm"
+date: "2024-06-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r names}
+# extract names from folders
+sample_names <- list.dirs(
+  path = here("data", "raw", "splitpipe", "combined"),
+  recursive = FALSE
+) |>
+  str_subset(pattern = "GL") |>
+  basename()
+
+sample_groups <- sample_names |>
+  str_extract(
+    pattern = "[^_]+"
+  )
+
+sample_list <- list(
+  sample_names[1:3],
+  sample_names[4:6],
+  sample_names[7:9],
+  sample_names[10:12]
+) |>
+  set_names(
+    sample_groups[1],
+    sample_groups[4],
+    sample_groups[7],
+    sample_groups[10],
+  )
+```
+
+```{r import}
+# the important scvi parts are the dimreds
+sce_list <- read_rds(
+  file = here("data", "processed", "1_2_filtered", "sce_combined.rds")
+)
+norm_labels <- read_rds(
+  file = here("data", "processed", "3_1_norm_labels", "norm_labels.rds")
+)
+```
+
+```{r new_dimred}
+sce_list <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    # calculated in jupyter notebook
+    reducedDim(sce, "X_scVI") <- read_csv(
+      file = here("data", "processed", "2_1_scvi", paste(i, "latent_dims.csv", sep = "_")),
+      col_select = -1,
+      skip = 1,
+      col_names = FALSE,
+      show_col_types = FALSE
+    ) |>
+      as.matrix()
+
+    reducedDim(sce, "X_scVI_MDE") <- read_csv(
+      file = here("data", "processed", "2_1_scvi", paste(i, "MDE.csv", sep = "_")),
+      show_col_types = FALSE
+    ) |>
+      select(-1) |>
+      as.matrix()
+
+    sce$leiden <- read_csv(
+      file = here("data", "processed", "2_1_scvi", paste(i, "leiden.csv", sep = "_")),
+      show_col_types = FALSE
+    ) |>
+      pull(leiden) |>
+      as.factor()
+
+    sce
+  }
+)
+```
+
+```{r norm_list}
+sce_norm_list <- imap(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce, i) {
+    # read in
+    norm_matrix <- vroom::vroom(
+      file = here("data", "processed", "2_1_scvi", paste(i, "norm.csv", sep = "_")),
+      show_col_types = FALSE
+    ) |>
+      column_to_rownames(var = "...1") |>
+      as.matrix()
+
+    SingleCellExperiment(
+      assays = list(
+        counts = norm_matrix
+      ),
+      reducedDims = reducedDims(sce),
+      colData = colData(sce),
+      rowData = rowData(sce) |>
+        as_tibble() |>
+        filter(gene_id %in% rownames(norm_matrix))
+    )
+  }
+)
+```
+
+```{r umap}
+plot_sample_dimred <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    p <- scater::plotReducedDim(
+      object = sce,
+      dimred = "X_scVI_MDE",
+      colour_by = "sample"
+    ) +
+      ggh4x::force_panelsizes(
+        rows = unit(x = 10, units = "cm"),
+        cols = unit(x = 10, units = "cm")
+      )
+    # hate this
+    p$facet$params$force.respect <- TRUE
+    p
+  }
+)
+
+plot_cluster_dimred <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    p <- scater::plotReducedDim(
+      object = sce,
+      dimred = "X_scVI_MDE",
+      colour_by = "leiden"
+    ) +
+      ggh4x::force_panelsizes(
+        rows = unit(x = 10, units = "cm"),
+        cols = unit(x = 10, units = "cm")
+      )
+    # hate this
+    p$facet$params$force.respect <- TRUE
+    p
+  }
+)
+
+walk(
+  .x = names(sce_list),
+  .f = function(x) {
+    ggsave(
+      filename = here("output", "plots", "2_1_integrated_dimred", paste(x, ".pdf", sep = "")),
+      plot = patchwork::wrap_plots(
+        plot_sample_dimred[[x]],
+        plot_cluster_dimred[[x]],
+        ncol = 2
+      ),
+      device = cairo_pdf,
+      width = 50,
+      height = 50,
+      units = "cm"
+    )
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "2_1_integrated_dimred", paste(x, ".pdf", sep = "")),
+        here("output", "plots", "2_1_integrated_dimred", paste(x, ".pdf", sep = ""))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r marker}
+```
+
+```{r bulk_deg}
+plot_bulk_deg <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    diff <- read_csv(
+      file = here(
+        "data", "processed", "2_1_scvi", paste(i, "sample.csv", sep = "_")
+      ),
+      show_col_types = FALSE
+    )
+
+    diff <- diff |>
+      rename(gene_id = 1) |>
+      left_join(
+        y = rowData(sce) |>
+          as_tibble() |>
+          select(gene_id, gene_name),
+        by = join_by(gene_id)
+      ) |>
+      relocate(gene_name)
+
+    volcano_plots <- diff$group1 |>
+      unique() |>
+      set_names() |>
+      map(
+        .f = function(x) {
+          # filter on comparisons
+          diff_filt <- diff |>
+            filter(group1 == x)
+
+          # big boilerplate energy
+          up_lfc <- diff_filt |>
+            filter(lfc_mean > 2) |>
+            pull(gene_name)
+          down_lfc <- diff_filt |>
+            filter(lfc_mean < -2) |>
+            pull(gene_name)
+          up_sig_label <- diff_filt |>
+            mutate(
+              rank = bayes_factor * lfc_mean
+            ) |>
+            arrange(-rank) |>
+            slice_head(n = 10) |>
+            pull(gene_name)
+          down_sig_label <- diff_filt |>
+            mutate(
+              rank = bayes_factor * lfc_mean
+            ) |>
+            arrange(rank) |>
+            slice_head(n = 20) |>
+            pull(gene_name)
+
+          diff_filt <- diff_filt |>
+            mutate(
+              sig = case_when(
+                gene_name %in% up_lfc & is_de_fdr_0.05 == TRUE ~ "up_sig",
+                gene_name %in% down_lfc & is_de_fdr_0.05 == TRUE ~ "down_sig"
+              )
+            ) |>
+            mutate(
+              colour_point = case_when(
+                sig == "up_sig" ~ "red",
+                sig == "down_sig" ~ "blue",
+                .default = "grey"
+              )
+            ) |>
+            mutate(
+              label_point = case_when(
+                gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+                .default = NA_character_
+              )
+            )
+
+          # plot
+          diff_filt |>
+            ggplot(
+              aes(
+                x = lfc_mean,
+                y = bayes_factor,
+                colour = colour_point,
+                label = label_point,
+                shape = is_de_fdr_0.05
+              )
+            ) +
+            geom_point() +
+            scale_colour_identity() +
+            theme(aspect.ratio = 1) +
+            ggrepel::geom_label_repel(
+              max.overlaps = 25,
+              size = 10 / .pt
+            ) +
+            ggtitle(label = x)
+        }
+      )
+
+    rrho <- RRHO::RRHO(
+      list1 = diff |>
+        # mutate(val = bayes_factor) |>
+        mutate(val = -log10(bayes_factor) * sign(lfc_mean)) |>
+        filter(group1 == unique(diff$group1)[1]) |>
+        select(gene_name, val) |>
+        distinct(gene_name, .keep_all = TRUE) |>
+        as.data.frame(),
+      list2 = diff |>
+        # mutate(val = bayes_factor) |>
+        mutate(val = -log10(bayes_factor) * sign(lfc_mean)) |>
+        filter(group1 == unique(diff$group1)[2]) |>
+        select(gene_name, val) |>
+        distinct(gene_name, .keep_all = TRUE) |>
+        as.data.frame(),
+      alternative = "two.sided"
+    )
+
+    # rrho_plot <- lattice::levelplot(
+    #   x = rrho$hypermat,
+    #   xlab = "pdn vs. tis",
+    #   ylab = "pdo vs. tis"
+    # )
+    # rrho_plot
+
+    names(rrho$hypermat) <- paste("X", 1:ncol(rrho$hypermat))
+
+    rrho_plot_gg <- rrho$hypermat |>
+      as_tibble() |>
+      rownames_to_column("var1") |>
+      pivot_longer(
+        cols = -var1, names_to = "var2", values_to = "value"
+      ) |>
+      mutate(
+        var1 = factor(var1, levels = 1:ncol(rrho$hypermat)),
+        var2 = factor(gsub("V", "", var2), levels = 1:ncol(rrho$hypermat))
+      ) |>
+      # mutate(
+      #   value = case_when(
+      #     !is.finite(value) ~ max(value[is.finite(value)]),
+      #     .default = value
+      #   )
+      # ) |>
+      ggplot(
+        mapping =
+          aes(
+            x = var1,
+            y = var2,
+            fill = value
+          )
+      ) +
+      geom_tile() +
+      scale_fill_viridis_c() +
+      labs(
+        x = "pdn vs. tis",
+        y = "pdo vs. tis"
+      ) +
+      theme(
+        aspect.ratio = 1,
+        axis.text = element_blank()
+      )
+    # rrho_plot_gg
+
+    patchwork::wrap_plots(
+      volcano_plots[[1]] +
+        ggh4x::force_panelsizes(rows = unit(10, "cm"), cols = unit(10, "cm")),
+      volcano_plots[[2]],
+      rrho_plot_gg,
+      nrow = 1
+    )
+  }
+)
+
+iwalk(
+  .x = plot_bulk_deg,
+  .f = function(x, i) {
+    ggsave(
+      filename = here("output", "plots", "2_3_bulk_deg", paste(i, "bulk_deg.pdf", sep = "_")),
+      plot = x,
+      device = cairo_pdf,
+      width = 50,
+      height = 50,
+      units = "cm"
+    )
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "2_3_bulk_deg", paste(i, "bulk_deg.pdf", sep = "_")),
+        here("output", "plots", "2_3_bulk_deg", paste(i, "bulk_deg.pdf", sep = "_"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r bulk_enrich}
+plot_bulk_enrich <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    diff <- read_csv(
+      file = here(
+        "data", "processed", "2_1_scvi", paste(i, "sample.csv", sep = "_")
+      ),
+      show_col_types = FALSE
+    )
+
+    diff <- diff |>
+      rename(gene_id = 1) |>
+      left_join(
+        y = rowData(sce) |>
+          as_tibble() |>
+          select(gene_id, gene_name),
+        by = join_by(gene_id)
+      ) |>
+      relocate(gene_name)
+
+    enrich_data <- diff$group1 |>
+      unique() |>
+      set_names() |>
+      map(
+        .f = function(x) {
+          # keep in function
+          library(enrichR)
+          diff_filt <- diff |>
+            filter(group1 == x)
+
+          up_genes <- diff_filt |>
+            filter(lfc_mean > 0) |>
+            filter(is_de_fdr_0.05 == TRUE) |>
+            pull(gene_name)
+          down_genes <- diff_filt |>
+            filter(lfc_mean < 0) |>
+            filter(is_de_fdr_0.05 == TRUE) |>
+            pull(gene_name)
+
+          up_res <- enrichR::enrichr(
+            genes = up_genes,
+            databases = c(
+              "GO_Molecular_Function_2018",
+              "KEGG_2013",
+              "Reactome_2013"
+            )
+          )
+          down_res <- enrichR::enrichr(
+            genes = down_genes,
+            databases = c(
+              "GO_Molecular_Function_2018",
+              "KEGG_2013",
+              "Reactome_2013"
+            )
+          )
+
+          up_plot <- enrichR::plotEnrich(
+            df = up_res$GO_Molecular_Function_2018
+          ) +
+            ggtitle(
+              label =
+                paste(x, "enrichment_up", sep = "_") |>
+                  paste("\n", names(up_res)[1], sep = "")
+            ) +
+            theme(aspect.ratio = 1 / 2)
+          down_plot <- enrichR::plotEnrich(
+            df = down_res$GO_Molecular_Function_2018
+          ) +
+            ggtitle(
+              label =
+                paste(x, "enrichment_down", sep = "_") |>
+                  paste("\n", names(up_res)[1], sep = "")
+            ) +
+            theme(aspect.ratio = 1 / 2)
+
+          patchwork::wrap_plots(
+            up_plot +
+              ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(10, "cm")),
+            down_plot,
+            ncol = 1
+          )
+        }
+      )
+  }
+)
+
+walk(
+  .x = plot_bulk_enrich,
+  .f = function(x) {
+    iwalk(
+      .x = x,
+      .f = function(y, i) {
+        ggsave(
+          filename = here("output", "plots", "2_4_bulk_enrich", paste(i, "bulk_enrich.pdf", sep = "_")),
+          plot = y,
+          device = cairo_pdf,
+          width = 50,
+          height = 50,
+          units = "cm"
+        )
+        system2(
+          command = "pdfcrop",
+          args = c(
+            here("output", "plots", "2_4_bulk_enrich", paste(i, "bulk_enrich.pdf", sep = "_")),
+            here("output", "plots", "2_4_bulk_enrich", paste(i, "bulk_enrich.pdf", sep = "_"))
+          ),
+          stdout = NULL
+        )
+      }
+    )
+  }
+)
+```
+
+```{r markers}
+# all vs one
+plot_markers <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    change_per_clust <- read_csv(
+      file = here("data", "processed", "2_1_scvi", paste(i, "cluster.csv", sep = "_")),
+      show_col_types = FALSE
+    ) |>
+      rename(gene_id = 1)
+
+    change_per_clust <- change_per_clust |>
+      left_join(
+        y = rowData(sce) |>
+          as_tibble() |>
+          select(gene_id, gene_name),
+        by = join_by(gene_id)
+      ) |>
+      relocate(gene_name)
+
+    plot_col <- Polychrome::kelly.colors(n = 1 + length(unique(sce$leiden)) + 1) |>
+      tail(-1) |>
+      set_names(0:length(unique(sce$leiden)))
+
+    patchwork::wrap_plots(
+      scater::plotReducedDim(
+        object = sce,
+        dimred = "X_scVI_MDE",
+        colour_by = "leiden"
+      ) +
+        theme(aspect.ratio = 1) +
+        scale_colour_manual(values = plot_col) +
+        ggh4x::force_panelsizes(
+          rows = unit(15, "cm"),
+          cols = unit(15, "cm")
+        ),
+      change_per_clust |>
+        group_by(group1) |>
+        slice_head(n = 5) |>
+        # select(gene_name, group1) |>
+        ggplot(
+          mapping = aes(
+            x = fct_inorder(gene_name),
+            y = group1,
+            colour = bayes_factor,
+            size = lfc_mean
+          )
+        ) +
+        geom_point() +
+        scale_y_continuous(breaks = scales::breaks_pretty()) +
+        scale_x_discrete(guide = guide_axis(angle = 45)) +
+        theme(
+          aspect.ratio = 1 / 2,
+          axis.text.x = element_text(colour = rep(plot_col, each = 5))
+        )
+    )
+  }
+)
+
+iwalk(
+  .x = plot_markers,
+  .f = function(x, i) {
+    ggsave(
+      filename = here("output", "plots", "2_5_markers", paste(i, "markers.pdf", sep = "_")),
+      plot = x,
+      device = cairo_pdf,
+      width = 75,
+      height = 75,
+      units = "cm"
+    )
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "2_5_markers", paste(i, "markers.pdf", sep = "_")),
+        here("output", "plots", "2_5_markers", paste(i, "markers.pdf", sep = "_"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r numbat}
+walk(
+  .x = sce_list,
+  .f = function(sce) {
+    walk(
+      .x = sce$sample |> unique(),
+      .f = function(sample) {
+        colData(sce) |>
+          as_tibble() |>
+          filter(sample == !!sample) |>
+          pull(bc_wells) |>
+          str_replace(pattern = "__", replacement = "_") |>
+          as_tibble_col() |>
+          write_csv(
+            col_names = FALSE,
+            file = here("data", "processed", "2_3_numbat", "barcodes", paste0(sample, ".csv"))
+          )
+      }
+    )
+  }
+)
+
+iwalk(
+  .x = sce_list,
+  .f = function(sce, i) {
+    colData(sce) |>
+      as_tibble() |>
+      pull(bc_wells) |>
+      str_replace(pattern = "__", replacement = "_") |>
+      # remove __s1
+      as_tibble_col() |>
+      write_csv(
+        col_names = FALSE,
+        file = here("data", "processed", "2_3_numbat", "barcodes", paste0(i, ".csv"))
+      )
+  }
+)
+
+numbat_res <- imap(
+  .progress = TRUE,
+  .x = sce_list[4],
+  .f = function(sce, i) {
+    # keep inside
+    library(numbat)
+
+    # prep matrix
+    sce$bc_wells_corr <- colData(sce) |>
+      as_tibble() |>
+      mutate(bc_wells = str_replace(bc_wells, pattern = "__", replacement = "_")) |>
+      pull(bc_wells)
+    count_mat <- counts(sce)
+    colnames(count_mat) <- sce$bc_wells_corr
+    rownames(count_mat) <- rowData(sce)$gene_name
+    count_mat <- count_mat[!duplicated(rownames(count_mat)), ]
+
+    # prep reference
+    ref_internal <- read_rds(
+      file = here("data", "processed", "3_1_norm_labels", "all_immune_numbat_ref.rds")
+    )
+    ref_internal <- ref_internal[!duplicated(rownames(ref_internal)), ]
+    ref_internal <- ref_internal[, "immune"]
+
+    # prep phased
+    df_allele <-
+      here("data", "processed", "2_3_numbat", "out", paste0(i, "_all"), paste0(i, "_all_allele_counts.tsv.gz")) |>
+      read_tsv(show_col_types = FALSE)
+
+    # prep ref snp
+    snp_consenseus_path <-
+      list(
+        GL0028 = "/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/plots/GL0028/207686170123_R01C02_segments.tsv",
+        GL0038 = "/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/plots/GL0038/207686170123_R02C01_segments.tsv",
+        GL0095 = "/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/plots/GL0095/208115890028_R02C01_segments.tsv",
+        GL0128 = "/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/plots/GL0128/208115890066_R03C02_segments.tsv"
+      )
+    snp_consenseus <- read_csv(
+      file = snp_consenseus_path[[i]],
+      show_col_types = FALSE
+    )
+    snp_consenseus <- snp_consenseus |>
+      mutate(
+        cnv_state = case_when(
+          nMajor == 1 & nMinor == 1 ~ "neu",
+          nMajor == 2 & nMinor == 0 ~ "loh",
+          nMajor == 1 & nMinor == 0 | nMajor == 0 & nMinor == 1 ~ "del",
+          nMajor + nMinor == 0 ~ "bdel",
+          nMajor >= 1 & nMinor == 1 | nMajor == 1 & nMinor >= 1 ~ "amp",
+          # redundant?
+          nMajor > nMinor & nMinor > 0 | nMinor > nMajor & nMajor > 0 ~ "amp",
+          nMajor == nMinor & nMajor >= 2 ~ "bamp"
+        )
+      ) |>
+      rename(
+        CHROM = chr,
+        seg_start = startpos,
+        seg_end = endpos
+      ) |>
+      group_by(CHROM) |>
+      mutate(
+        seg = paste(as.character(CHROM), letters[seq_along(CHROM)], sep = "")
+      ) |>
+      select(
+        CHROM, seg, seg_start, seg_end, cnv_state
+      )
+
+    # justin
+    gc()
+
+    # run
+    numbat::run_numbat(
+      count_mat = as.matrix(count_mat),
+      lambdas_ref = ref_internal,
+      df_allele = df_allele,
+      # t = 1e-04,
+      max_iter = 5,
+      # min_LLR = 0.1,
+      # init_k = 10,
+      # skip_nj = TRUE,
+      max_entropy = 10,
+      genome = "hg38",
+      ncores = 32,
+      plot = TRUE,
+      call_clonal_loh = FALSE,
+      # segs_consensus_fix = snp_consenseus,
+      check_convergence = FALSE,
+      out_dir = here("data", "processed", "2_4_numbat_out", i)
+    )
+  }
+)
+
+plot_numbat <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    library(numbat)
+    nb <- Numbat$new(out_dir = here("data", "processed", "2_4_numbat_out", i))
+
+    sce$bc_wells_corr <- colData(sce) |>
+      as_tibble() |>
+      pull(bc_wells) |>
+      str_replace(pattern = "__", replacement = "_")
+
+    colData(sce) <- colData(sce) |>
+      as_tibble() |>
+      left_join(
+        y = nb[["clone_post"]] |>
+          as_tibble() |>
+          rename(bc_wells_corr = cell) |>
+          select(bc_wells_corr, clone_opt, compartment_opt, p_cnv),
+        by = join_by(bc_wells_corr)
+      ) |>
+      DataFrame()
+
+    sce$clone_opt <- as.factor(sce$clone_opt)
+
+    # sce <- scater::runUMAP(
+    #   x = sce,
+    #   dimred = "X_scVI",
+    #   name = "X_scVI_UMAP"
+    #   )
+    
+    patchwork::wrap_plots(
+      map(
+        .x = c("clone_opt", "compartment_opt", "p_cnv", "sample"),
+        .f = function(x) {
+          scater::plotReducedDim(
+            object = sce,
+            dimred = "X_scVI_MDE",
+            colour_by = x
+          ) + 
+            theme(aspect.ratio = 1)
+        }
+      )
+    ) 
+  }
+)
+
+
+
+norm_bc_wells <- colData(sce) |>
+  as_tibble() |>
+  filter(compartment_opt == "normal") |>
+  pull(bc_wells)
+
+write_rds(
+  x = norm_bc_wells,
+  file = here("data", "processed", "2_4_numbat_out", "GL0038_norm.rds")
+)
+```
+
+
+
+
+
+```{r distance}
+# how integrated is integrated?
+source(file = here("eval", "scripts", "r", "distance_data.r"))
+
+distance_data <- imap(
+  .x = distance_data,
+  .f = function(x, i) {
+    x |>
+      left_join(
+        y = colData(sce_list[[i]]) |>
+          as_tibble() |>
+          select(bc_wells, sample) |>
+          rename(to = bc_wells, sample_to = sample),
+        by = join_by(to)
+      )
+  }
+)
+
+plot_distance <- imap(
+  .x = distance_data,
+  .f = function(x, i) {
+    plot_data <- x |>
+      group_by(to) |>
+      summarise(
+        length_mean = mean(distance_length),
+        node_mean = mean(distance_node),
+        length_min = min(distance_length),
+        node_min = min(distance_node),
+        sample_to = unique(sample_to)
+      ) |>
+      ungroup() |>
+      select(-to)
+
+    map(
+      # remove last element
+      .x = head(x = colnames(plot_data), n = -1),
+      .f = function(y) {
+        plot_data |>
+          ggplot(
+            aes(
+              x = sample_to,
+              y = !!ensym(y)
+            )
+          ) +
+          geom_jitter(alpha = 0.5) +
+          geom_violin(adjust = 2, alpha = 0.5) +
+          ggtitle(label = i) +
+          theme(aspect.ratio = 1)
+      }
+    ) |>
+      patchwork::wrap_plots()
+  }
+)
+
+walk(
+  .x = unique(sample_groups),
+  .f = function(x) {
+    a <- plot_sample_dimred[[x]]
+    a <- ggplotify::as.ggplot(a)
+    a <- a +
+      ggh4x::force_panelsizes(
+        rows = unit(x = 15, units = "cm"),
+        cols = unit(x = 15, units = "cm")
+      )
+    a$facet$params$force.respect <- TRUE
+    b <- plot_distance[[x]]
+    b <- ggplotify::as.ggplot(b)
+    b <- b +
+      ggh4x::force_panelsizes(
+        rows = unit(x = 15, units = "cm"),
+        cols = unit(x = 15, units = "cm")
+      )
+    b$facet$params$force.respect <- TRUE
+
+    ggsave(
+      filename = here("output", "plots", "2_2_distance", paste(x, "distance.pdf", sep = "_")),
+      plot = patchwork::wrap_plots(a, b),
+      device = cairo_pdf,
+      width = 50,
+      height = 50,
+      units = "cm"
+    )
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "2_2_distance", paste(x, "distance.pdf", sep = "_")),
+        here("output", "plots", "2_2_distance", paste(x, "distance.pdf", sep = "_"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r norm_expr}
+map(
+  .x = sce_list,
+  .f = function(sce) {
+
+  }
+)
+```
+
+
+```{r cluster}
+sce_list <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    set.seed(42)
+    clusters <- scran::clusterCells(
+      x = sce,
+      use.dimred = "X_scVI",
+      BLUSPARAM = bluster::SNNGraphParam(
+        # k = 20,
+        type = "jaccard",
+        cluster.fun = "louvain",
+        BNPARAM = BiocNeighbors::HnswParam()
+      )
+    )
+    # clusters <- scran::clusterCells(
+    #   x = sce,
+    #   assay.type = NULL,
+    #   use.dimred = "X_scVI"
+    # )
+    sce$cluster <- clusters
+    sce
+  }
+)
+
+map(
+  .x = sce_list,
+  .f = function(sce) {
+    scater::plotReducedDim(
+      object = sce,
+      dimred = "X_scVI_UMAP",
+      colour_by = "cluster"
+    )
+  }
+)
+```
+
+```{r deg}
+diff_exp_pdo <- read_csv(
+  file = here("data", "processed", "2_1_scvi", "GL0028_PDO_TIS.csv"),
+  show_col_types = FALSE
+) |>
+  rename(gene_id = 1)
+diff_exp_pdn <- read_csv(
+  file = here("data", "processed", "2_1_scvi", "GL0028_PDN_TIS.csv"),
+  show_col_types = FALSE
+) |>
+  rename(gene_id = 1)
+
+diff_exp_pdn <- diff_exp_pdn |>
+  left_join(
+    y = rowData(sce_list$GL0095) |>
+      as_tibble() |>
+      select(gene_id, gene_name),
+    by = join_by(gene_id)
+  ) |>
+  relocate(gene_name, .before = gene_id)
+diff_exp_pdo <- diff_exp_pdo |>
+  left_join(
+    y = rowData(sce_list$GL0095) |>
+      as_tibble() |>
+      select(gene_id, gene_name),
+    by = join_by(gene_id)
+  ) |>
+  relocate(gene_name, .before = gene_id)
+
+dat_pdn <- diff_exp_pdn |>
+  filter(group1 == 4 & group2 == 4)
+dat_pdo <- diff_exp_pdo |>
+  filter(group1 == 4 & group2 == 4)
+
+left_join(
+  dat_pdn |>
+    select(gene_name, bayes_factor, lfc_mean, is_de_fdr_0.05) |>
+    mutate(sample = "pdn") |>
+    rename_with(.fn = function(x) paste(x, "pdn", sep = "_")) |>
+    rename(gene_name = gene_name_pdn),
+  dat_pdo |>
+    select(gene_name, bayes_factor, lfc_mean, is_de_fdr_0.05) |>
+    mutate(sample = "pdo") |>
+    rename_with(.fn = function(x) paste(x, "pdo", sep = "_")) |>
+    rename(gene_name = gene_name_pdo)
+) |>
+  ggplot(
+    mapping = aes(
+      x = lfc_mean_pdo,
+      y = lfc_mean_pdn
+    )
+  ) +
+  geom_point() +
+  coord_fixed()
+theme(aspect.ratio = 1)
+
+res <- RRHO::RRHO(
+  list1 = dat_pdn |>
+    mutate(val = -log10(proba_de) * sign(lfc_mean)) |>
+    # filter(is_de_fdr_0.05 == TRUE) |>
+    select(gene_name, val) |>
+    distinct(gene_name, .keep_all = TRUE) |>
+    as.data.frame(),
+  list2 = dat_pdo |>
+    mutate(val = -log10(proba_de) * sign(lfc_mean)) |>
+    # filter(is_de_fdr_0.05 == TRUE) |>
+    select(gene_name, val) |>
+    distinct(gene_name, .keep_all = TRUE) |>
+    as.data.frame(),
+  alternative = "two.sided"
+)
+
+lattice::levelplot(res$hypermat)
+
+sdat |>
+  ggplot(
+    aes(
+      x = lfc_mean,
+      y = bayes_factor,
+      colour = is_de_fdr_0.05
+    )
+  ) +
+  geom_point() +
+  theme(aspect.ratio = 1)
+```
+
+```{r markers}
+marker_list <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    list <- scran::findMarkers(
+      x = sce,
+      groups = sce$cluster,
+      test.type = "wilcox",
+      pval.type = "all",
+      lfc = 2,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    ) |>
+      as.list()
+
+    map(
+      .x = list,
+      .f = function(x) {
+        x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(
+            y = rowData(sce) |>
+              as_tibble() |>
+              select(gene_id, gene_name),
+            by = "gene_id"
+          ) |>
+          relocate(gene_name, .after = gene_id)
+      }
+    )
+  }
+)
+
+r <- quantile(igraph::strength(GL0028_snn_graph))[2] / (igraph::gorder(GL0028_snn_graph) - 1)
+
+res <- igraph::cluster_leiden(
+  graph = GL0028_snn_graph,
+  resolution_parameter = r
+)
+sce_list[[x]]$cluster <- res$membership |>
+  as_factor()
+res$membership |> table()
+
+hvgs <- scran::getTopHVGs(sce_list[[x]], n = 1000)
+
+out <- scran::pairwiseTTests(
+  x = logcounts(sce_list[[x]]),
+  groups = sce_list[[x]]$cluster,
+  # block = sce_list[[x]]$sample,
+  lfc = 1.5,
+  direction = "any",
+  # subset.row = hvgs,
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+
+markers <- scran::combineMarkers(
+  de.lists = out$statistics,
+  pairs = out$pairs,
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+
+scater::plotHeatmap(
+  object = sce_list[[x]],
+  features = map(
+    .x = markers,
+    .f = function(y) {
+      gene_ids <- y |>
+        as_tibble(rownames = "gene") |>
+        head(n = 5) |>
+        # filter(Top == 1) |>
+        pull(gene)
+      rowData(sce_list[[x]]) |>
+        as_tibble() |>
+        filter(gene_id %in% gene_ids) |>
+        pull(gene_name)
+    }
+  ) |>
+    unlist(use.names = FALSE) |>
+    unique(),
+  # features = map(
+  #   .x = marker_list[[x]],
+  #   .f = function(y) {
+  #     head(y, n = 5) |>
+  #       pull(gene_name)
+  #   }
+  # ) |>
+  #   unlist(use.names = FALSE) |>
+  #   unique(),
+  # center = TRUE,
+  # zlim = c(0, 5),
+  column_annotation_colours = list(
+    cluster = Polychrome::kelly.colors()[1:length(markers)] |>
+      set_names(names(markers)),
+    sample = c("red", "green", "blue") |>
+      set_names(unique(sce_list[[x]]$sample))
+  ),
+  colour = viridis::viridis(n = 1000),
+  # cluster_cols = TRUE,
+  order_columns_by = list("cluster", "sample"),
+  # colour_columns_by = "cluster",
+  swap_rownames = "gene_name"
+)
+
+
+scater::plotReducedDim(
+  object = sce_list[[x]],
+  dimred = "X_scVI_UMAP",
+  colour_by = "cluster"
+)
+
+plot_marker <- map(
+  .progress = TRUE,
+  .x = names(sce_list),
+  .f = function(x) {
+    library(furrr)
+    plan(multisession, workers = length(parallelly::availableWorkers()) - 1)
+
+    expr_plots <- map(
+      .x = 1:length(unique(sce_list[[x]]$cluster)),
+      .f = function(y) {
+        top_genes_to_plot <- marker_list[[x]][[y]] |>
+          head(9) |>
+          select(gene_id, gene_name) |>
+          mutate(gene_name = as.character(gene_name))
+
+        p <- scater::plotExpression(
+          object = sce_list[[x]],
+          features = top_genes_to_plot$gene_id,
+          x = "cluster",
+          colour_by = "cluster",
+          scattermore = TRUE,
+          point_size = 0
+        ) +
+          theme(
+            # aspect.ratio = 1,
+            axis.title.y = element_blank(),
+            legend.position = "none",
+            plot.title = element_text(face = "plain")
+          ) +
+          ggtitle(label = paste("cluster", y)) +
+          ggh4x::facet_wrap2(
+            drop = FALSE,
+            ~Feature,
+            labeller = as_labeller(
+              # named vector
+              deframe(top_genes_to_plot)
+            )
+          )
+        p
+      }
+    )
+    umap_plot <- scater::plotReducedDim(
+      object = sce_list[[x]],
+      dimred = "X_scVI_UMAP",
+      colour_by = "cluster",
+      scattermore = FALSE
+    ) +
+      theme(
+        # aspect.ratio = 1,
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(face = "plain")
+      ) +
+      ggtitle(label = x)
+
+    # align
+    # patchwork::wrap_plots(
+    append(
+      list(umap_plot),
+      expr_plots
+    )
+    # )
+  }
+) |>
+  set_names(names(sce_list))
+
+# this feels jank
+# separate because this takes time - why??
+plot_marker <- plot_marker |>
+  map(
+    .progress = TRUE,
+    # .x = marker_plots,
+    .f = function(plots) {
+      p <- plots |>
+        # align
+        patchwork::wrap_plots(ncol = 4) |>
+        # now the aligned plot is single plot and loses facets
+        ggplotify::as.ggplot()
+      # calc n_rows for final plot size
+      n_rows <- ceiling(
+        length(plots) / 4
+      )
+      p + ggh4x::force_panelsizes(
+        rows = unit(x = n_rows * 15, "cm"),
+        cols = unit(60, "cm")
+      )
+    }
+  )
+# save
+iwalk(
+  .progress = TRUE,
+  .x = plot_marker,
+  .f = function(x, i) {
+    ggsave(
+      plot = x,
+      filename =
+        here("output", "plots", "5_markers", paste0(i, "_marker_genes", ".pdf")),
+      device = cairo_pdf,
+      width = 100,
+      height = 100,
+      units = "cm"
+    )
+    # trim
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "5_markers", paste0(i, "_marker_genes", ".pdf")),
+        here("output", "plots", "5_markers", paste0(i, "_marker_genes", ".pdf"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+
+```{r cyclone}
+cycle_pairs <- read_rds(
+  file = system.file("exdata", "human_cycle_markers.rds", package = "scran")
+)
+
+cyclone_scores <- map(
+  .progress = TRUE,
+  .x = scvi_list,
+  .f = function(sce) {
+    scran::cyclone(
+      x = counts(sce),
+      pairs = cycle_pairs,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    )
+  }
+)
+# add normalised scores in
+scvi_list <- imap(
+  .x = scvi_list,
+  .f = function(sce, i) {
+    colData(sce) <- colData(sce) |>
+      as_tibble() |>
+      cbind(cyclone_scores[[i]]$normalized.scores) |>
+      DataFrame()
+
+    sce
+  }
+)
+# squiz
+imap(
+  .x = scvi_list,
+  .f = function(sce, i) {
+    map(
+      .x = c("sample", "leiden", "G2M"),
+      .f = function(y) {
+        scater::plotReducedDim(
+          object = sce,
+          dimred = "X_scVI_MDE",
+          colour_by = y
+        )
+      }
+    ) |>
+      patchwork::wrap_plots()
+  }
+)
+```
+
+```{r}
+# TEMP
+
+reducedDim(sce_list$GL0038, "X_scVI_MDE") <- read_csv(file = here("data", "processed", "2_1_scvi", "GL0038_MDE.csv")) |>
+  select(-1) |>
+  as.matrix()
+
+
+norm_exp <- vroom::vroom(
+  file = here("data", "processed", "2_1_scvi", "GL0038_norm.csv"),
+  show_col_types = FALSE
+)
+norm_exp <- norm_exp |>
+  column_to_rownames(var = colnames(norm_exp)[1])
+full_exp <- sce_list$GL0038 |>
+  logcounts()
+
+norm_exp_res <- SingleR::SingleR(
+  # test = full_exp |>
+  test = norm_exp |>
+    as.matrix(),
+  ref = logcounts(ref_list$couturier) |>
+    as.matrix(),
+  labels = colData(ref_list$couturier)$cluster,
+  de.method = "wilcox",
+  restrict = rownames(norm_exp),
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+patchwork::wrap_plots(
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = I(norm_exp_res$labels)
+  ),
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = I(full_exp_res$labels)
+  ),
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = "sample"
+  )
+)
+
+full_anno_list <- readRDS(file = here("eval", "full_list.rds"))
+# size of each set
+num_genes <- 100
+# extract and format
+full_anno_sets <- map(
+  .x = names(full_anno_list),
+  .f = function(x) {
+    tibble(
+      !!paste(x, "high", sep = "_") := full_anno_list[[x]] |>
+        head(num_genes) |>
+        pull(gene_name),
+      !!paste(x, "low", sep = "_") := full_anno_list[[x]] |>
+        tail(num_genes) |>
+        pull(gene_name)
+    )
+  }
+) |>
+  bind_cols()
+
+rownames(norm_exp) <- rownames(norm_exp) |>
+  as_tibble_col(column_name = "gene_id") |>
+  left_join(
+    y = rowData(sce_list$GL0028) |>
+      as_tibble() |>
+      select(gene_id, gene_name)
+  ) |>
+  pull(gene_name)
+full_exp <- logcounts(sce_list$GL0038)
+rownames(full_exp) <- rownames(full_exp) |>
+  as_tibble_col(column_name = "gene_id") |>
+  left_join(
+    y = rowData(sce_list$GL0028) |>
+      as_tibble() |>
+      select(gene_id, gene_name)
+  ) |>
+  pull(gene_name)
+
+ssgsea_scores_norm <- escape::escape.matrix(
+  # input.data = norm_exp |>
+  input.data = norm_exp |>
+    as.matrix(),
+  gene.sets = as.list(full_anno_sets),
+  method = "UCell",
+  # groups = 1000,
+  min.size = 5,
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+ssgsea_scores_full <- as_tibble(ssgsea_scores_full)
+ssgsea_scores_norm <- as_tibble(ssgsea_scores_norm)
+
+ssgsea_scores_full_norm <- map(
+  .x = colnames(ssgsea_scores_full) |>
+    str_split(pattern = "_") |>
+    map_vec(1) |>
+    unlist() |>
+    unique(),
+  .f = function(x) {
+    ssgsea_scores_full %>%
+      # as_tibble(rownames = "barcode") |>
+      select(contains(x)) %>%
+      # high before low
+      mutate(!!paste(x, "norm", sep = "_") := .[[1]] - .[[2]]) |>
+      select(3)
+  }
+) |>
+  bind_cols()
+
+
+case_when(
+  ssgsea_scores_norm_norm$prog_norm > quantile(x = ssgsea_scores_norm_norm$prog_norm, probs = 0.95) ~ ssgsea_scores_norm_norm$prog_norm,
+  .default = 0
+)
+
+patchwork::wrap_plots(
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = I(ssgsea_scores_norm$mes_low)
+    #     colour_by = I(case_when(
+    #   ssgsea_scores_norm_norm$oligo_norm > quantile(x = ssgsea_scores_norm_norm$oligo_norm, probs = 0.8) ~ ssgsea_scores_norm_norm$oligo_norm,
+    #   .default = NA
+    # ))
+  ),
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = I(ssgsea_scores_full$mes_high)
+  ),
+  scater::plotReducedDim(
+    object = sce_list$GL0038,
+    dimred = "X_scVI_MDE",
+    colour_by = "ENSG00000131747"
+  )
+)
+```
+
+```{r singler}
+source(here("eval", "scripts", "r", "load_ref_list.R"))
+source(here("eval", "scripts", "r", "singler_anno_func.R"))
+
+ref_list <- load_ref_list()
+
+ref_hvgs <- map(
+  .progress = TRUE,
+  .x = ref_list,
+  .f = function(ref) {
+    scran::modelGeneVar(
+      x = ref,
+      # gotta go fast
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    ) |>
+      scran::getTopHVGs(n = 5000)
+  }
+)
+test_hvgs <- map(
+  .progress = TRUE,
+  .x = scvi_list,
+  .f = function(sce) {
+    scran::modelGeneVar(
+      x = sce,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    ) |>
+      scran::getTopHVGs(n = 5000)
+  }
+)
+
+cell_labels <- singler_anno_func(
+  test_list = scvi_list,
+  ref_list = ref_list,
+  test_hvgs = test_hvgs,
+  ref_hvgs = ref_hvgs,
+  per_cluster = FALSE
+)
+scvi_list <- imap(
+  .x = scvi_list,
+  .f = function(sce, i) {
+    # filter for each sample
+    filtered_tib <- cell_labels |>
+      filter(test == i)
+    # for each reference
+    final_labels <- map(
+      .x = filtered_tib$ref,
+      .f = function(ref_unique) {
+        filtered_tib |>
+          filter(ref == ref_unique) |>
+          unnest(cols = "pred") |>
+          select(bc_wells, pruned.labels) |>
+          rename(
+            !!paste(ref_unique, "cell_label", sep = "_") := pruned.labels
+          )
+      }
+    ) |>
+      purrr::reduce(.f = left_join, by = "bc_wells")
+
+    colData(sce) <- colData(sce) |>
+      as_tibble() |>
+      left_join(
+        y = final_labels,
+        by = "bc_wells"
+      ) |>
+      DataFrame()
+
+    sce
+  }
+)
+cluster_labels <- singler_anno_func(
+  test_list = scvi_list,
+  ref_list = ref_list,
+  test_hvgs = test_hvgs,
+  ref_hvgs = ref_hvgs,
+  per_cluster = TRUE,
+  cluster_label = "leiden"
+)
+scvi_list <- imap(
+  .x = scvi_list,
+  .f = function(sce, i) {
+    # filter for each sample
+    filtered_tib <- cluster_labels |>
+      filter(test == i)
+    # for each reference
+    final_labels <- map(
+      .x = filtered_tib$ref,
+      .f = function(ref_unique) {
+        filtered_tib |>
+          filter(ref == ref_unique) |>
+          unnest(cols = "pred") |>
+          select(cluster, pruned.labels) |>
+          rename(
+            !!paste(ref_unique, "cluster_label", sep = "_") := pruned.labels
+          )
+      }
+    ) |>
+      purrr::reduce(.f = left_join, by = "cluster")
+
+    colData(sce) <- colData(sce) |>
+      as_tibble() |>
+      left_join(
+        y = final_labels,
+        by = "cluster"
+      ) |>
+      DataFrame()
+
+    sce
+  }
+)
+
+map(
+  .x = scvi_list,
+  .f = function(sce) {
+    map(
+      .x = c("sample", "leiden", "G2M", "couturier_cluster_label", "couturier_cell_label"),
+      .f = function(y) {
+        scater::plotReducedDim(
+          object = sce,
+          dimred = "UMAP",
+          colour_by = y
+        )
+      }
+    ) |>
+      patchwork::wrap_plots()
+  }
+)
+
+imap(
+  .x = scvi_list,
+  .f = function(sce, i) {
+    dat <- colData(sce) |>
+      as_tibble() |>
+      select(couturier_cluster_label, couturier_cell_label)
+
+    table(dat$couturier_cluster_label, dat$couturier_cell_label) |>
+      proportions() |>
+      as.data.frame() |>
+      as_tibble() |>
+      rename(cluster = 1, label = 2, prop = 3) |>
+      ggplot(
+        aes(
+          x = cluster,
+          y = prop,
+          fill = label
+        )
+      ) +
+      geom_bar(position = "fill", stat = "identity") +
+      ggtitle(label = i)
+  }
+)
+```

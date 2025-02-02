@@ -1,0 +1,1249 @@
+---
+title: "preprocess"
+author: "zm"
+date: "2024-04-30"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+this markdown is designed to be run_all
+
+analysis/
+├─ markdown/
+├─ scripts/
+│  ├─ bash/
+│  ├─ r/
+data/
+├─ meta/
+├─ processed/
+├─ raw/
+output/
+├─ plots/
+
+```{r sync, eval=FALSE, include=FALSE}
+# placeholder
+stornext_path <-
+  "/stornext/Bioinf/data/lab_brain_cancer/projects/pdo_pdn_comparison/"
+vast_path <-
+  "vast/scratch/users/moore.z/pdo_pdn_comparison"
+system2(
+  command = "sbatch",
+  args = paste(
+    stornext_path,
+    "analysis", "scripts", "bash", "rsync_stornext_to_vast.slurm",
+    sep = "/"
+  )
+)
+```
+
+```{r here}
+# https://twitter.com/hadleywickham/status/940021008764846080
+library(here)
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(SingleCellExperiment)
+  # last to avoid conflicts
+  library(tidyverse)
+})
+```
+
+```{r scripts}
+# source all within folder
+walk(
+  .x = list.files(
+    path = here("analysis", "scripts", "r"),
+    full.names = TRUE
+  ),
+  .f = source
+)
+```
+
+```{r params}
+add_ensembl <- FALSE
+annotate_data <- TRUE
+```
+
+```{r import}
+# extract names from folders
+sample_names <- list.dirs(
+  path = here("data", "raw"),
+  recursive = FALSE
+) |>
+  str_subset(pattern = "GL") |>
+  basename()
+
+sample_names <- case_when(
+  sample_names == "GL0095_PDN" ~ "GL0095_T",
+  sample_names == "GL0095_T" ~ "GL0095_PDN",
+  .default = sample_names
+)
+
+sample_groups <- sample_names |>
+  str_extract(
+    pattern = "[^_]+"
+  )
+sample_list <- list(
+  sample_names[1:3],
+  sample_names[4:6],
+  sample_names[9:7],
+  sample_names[10:12]
+) |>
+  set_names(
+    sample_groups[1],
+    sample_groups[4],
+    sample_groups[7],
+    sample_groups[10],
+  )
+
+# import sce
+sce_list <- map(
+  .progress = TRUE,
+  .x = sample_names,
+  .f = function(x) {
+    # sce <- zellkonverter::readH5AD(
+    #   file = here("data", "raw", x, "DGE_filtered", "anndata.h5ad")
+    # )
+    # # remove extraneous data
+    # rowData(sce) <- rowData(sce)[, c("gene_id", "gene_name", "genome")]
+    # # set counts
+    # logcounts(object = sce) <- assay(sce, "X")
+
+    # preprocessed file does NOT have raw counts
+    mat <- Matrix::readMM(
+      file = here("data", "raw", x, "DGE_filtered", "count_matrix.mtx")
+    ) |>
+      t()
+    gene_info <- read_csv(
+      file = here("data", "raw", x, "DGE_filtered", "all_genes.csv"),
+      show_col_types = FALSE
+    )
+    cell_meta <- read_csv(
+      file = here("data", "raw", x, "DGE_filtered", "cell_metadata.csv"),
+      show_col_types = FALSE
+    )
+
+    rownames(mat) <- gene_info$gene_id
+    colnames(mat) <- cell_meta$bc_wells
+
+    # collate
+    sce <- SingleCellExperiment(
+      assays = list(
+        counts = mat
+      ),
+      colData = cell_meta,
+      rowData = gene_info
+    )
+
+    # add logcounts
+    sce <- scuttle::logNormCounts(x = sce)
+
+    # return
+    sce
+  }
+) |>
+  set_names(sample_names)
+
+# sort
+sce_list <- sce_list[sort(names(sce_list))]
+```
+
+```{r barcode_rank}
+# barcode_rank_list <- map(
+#   .x = sce_list,
+#   .f = function(sce) {
+#     DropletUtils::barcodeRanks(
+#       m = counts(sce)
+#     )
+#   }
+# )
+#
+# barcode_rank_plots <- map(
+#   .x = names(sce_list),
+#   .f = function(x) {
+#     num_above_knee <-
+#       (barcode_rank_list[[x]]$total >
+#         barcode_rank_list[[x]]@metadata$knee) |>
+#       which() |>
+#       length()
+#     num_above_inflection <-
+#       (barcode_rank_list[[x]]$total >
+#         barcode_rank_list[[x]]@metadata$inflection) |>
+#       which() |>
+#       length()
+#
+#     barcode_rank_list[[x]] |>
+#       as_tibble() |>
+#       ggplot(
+#         aes(
+#           x = rank,
+#           y = total
+#         )
+#       ) +
+#       geom_point() +
+#       ggtitle(label = x) +
+#       ylab("tscp_count") +
+#       scale_x_log10(
+#         breaks = 10^(-10:10),
+#         minor_breaks = rep(1:9, 21) * (10^rep(-10:10, each = 9)),
+#         labels = scales::comma
+#       ) +
+#       scale_y_log10(
+#         breaks = 10^(-10:10),
+#         minor_breaks = rep(1:9, 21) * (10^rep(-10:10, each = 9)),
+#         labels = scales::comma
+#       ) +
+#       geomtextpath::geom_texthline(
+#         mapping = aes(
+#           yintercept = yintercept,
+#           label = label
+#         ),
+#         data = tibble(
+#           yintercept = barcode_rank_list[[x]]@metadata$knee,
+#           label = paste(
+#             "knee",
+#             num_above_knee,
+#             sep = "\n"
+#           )
+#         ),
+#         colour = "red"
+#       ) +
+#       geomtextpath::geom_texthline(
+#         mapping = aes(
+#           yintercept = yintercept,
+#           label = label
+#         ),
+#         data = tibble(
+#           yintercept = barcode_rank_list[[x]]@metadata$inflection,
+#           label = paste(
+#             "inflection",
+#             num_above_inflection,
+#             sep = "\n"
+#           )
+#         ),
+#         colour = "blue"
+#       ) +
+#       theme(
+#         aspect.ratio = 1,
+#         plot.title = element_text(face = "plain")
+#       ) +
+#       ggh4x::force_panelsizes(
+#         rows = unit(10, "cm"),
+#         cols = unit(10, "cm")
+#       )
+#   }
+# ) |>
+#   set_names(names(sce_list))
+# # save
+# iwalk(
+#   .x = sample_list,
+#   .f = function(x, i) {
+#     ggsave(
+#       filename =
+#         here("output", "plots", "2_barcode_rank", paste0(i, "_barcode.pdf")),
+#       plot = barcode_rank_plots[x] |>
+#         patchwork::wrap_plots(nrow = 1),
+#       device = cairo_pdf,
+#       width = 50,
+#       height = 50,
+#       units = "cm"
+#     )
+#     # trim
+#     system2(
+#       command = "pdfcrop",
+#       args = c(
+#         here("output", "plots", "2_barcode_rank", paste0(i, "_barcode.pdf")),
+#         here("output", "plots", "2_barcode_rank", paste0(i, "_barcode.pdf"))
+#       ),
+#       stdout = NULL
+#     )
+#   }
+# )
+#
+# sce_list <- map(
+#   .x = names(sce_list),
+#   # .y = barcode_rank_list,
+#   .f = function(x) {
+#     sce_list[[x]][, sce_list[[x]]$tscp_count >
+#                     barcode_rank_list[[x]]@metadata$inflection]
+#   }
+# ) |>
+#   set_names(names(sce_list))
+```
+
+```{r ensembl}
+if (add_ensembl) {
+  # this doesn't add much
+  # import annotation
+  ensembl <- rtracklayer::import(
+    con = here("data", "meta", "Homo_sapiens.GRCh38.112.gtf.gz")
+  )
+
+  # filter for gene only
+  ensembl <- ensembl[ensembl$type == "gene"]
+
+  # filter only metadata columns that are gene related
+  mcols(ensembl) <- mcols(ensembl) |>
+    dtplyr::lazy_dt() |>
+    select(contains(match = "gene")) |>
+    DataFrame()
+
+  sce_list <- map(
+    .x = sce_list,
+    .f = function(sce) {
+      # add in extra data
+      rowData(sce) <- rowData(sce) |>
+        dtplyr::lazy_dt() |>
+        left_join(
+          y = mcols(ensembl) |>
+            as_tibble(),
+          by = c("gene_id", "gene_name")
+        ) |>
+        DataFrame()
+      # return
+      sce
+    }
+  )
+}
+```
+
+```{r qc}
+if (file.exists(here("data", "processed", "mitochondrial_genes.rds"))) {
+  mitochondrial_genes <- readRDS(
+    file = here("data", "processed", "mitochondrial_genes.rds")
+  )
+} else {
+  mitochondrial_genes <- ensembl |>
+    subset(seqnames == "MT") |>
+    as_tibble()
+}
+mito_threshold <- 5
+
+sce_list <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    # filter for expressed genes
+    # will throw error otherwise
+    mitochondrial_genes_subset <- mitochondrial_genes |>
+      filter(gene_id %in% row.names(sce)) |>
+      pull(gene_id)
+    # mitochondrial_genes$gene_id %in% row.names(sce)
+
+    # add
+    sce <- scuttle::addPerCellQCMetrics(
+      x = sce,
+      subsets = list(mito = mitochondrial_genes_subset)
+    )
+    # reasons
+    reasons <- scuttle::perCellQCFilters(
+      x = sce,
+      sub.fields = c("subsets_mito_percent")
+    )
+
+    # add
+    colData(sce) <- cbind(
+      colData(sce),
+      reasons
+    )
+    # use our threshold instead
+    sce$discard_mito <- sce$subsets_mito_percent > mito_threshold
+    # or or or
+    sce$discard_final <- sce$low_n_features | sce$low_lib_size | sce$discard_mito
+
+    # return
+    sce
+  }
+)
+
+qc_plots <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    list(
+      sum = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "sum",
+        colour_by = "discard_final"
+      ) +
+        scale_y_log10() +
+        # theme(aspect.ratio = 2) +
+        theme(plot.title = element_text(face = "plain")) +
+        ggtitle(label = i),
+      detected = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "detected",
+        colour_by = "discard_final"
+      ) +
+        scale_y_log10(),
+      # theme(aspect.ratio = 2),
+      mito = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "subsets_mito_percent",
+        colour_by = "discard_final"
+      )
+      # theme(aspect.ratio = 2)
+    ) |>
+      patchwork::wrap_plots(nrow = 1)
+  }
+)
+
+# save
+iwalk(
+  .x = sample_list,
+  .f = function(x, i) {
+    ggsave(
+      filename =
+        here("output", "plots", "1_qc", paste0(i, "_qc.pdf")),
+      plot = qc_plots[x] |>
+        patchwork::wrap_plots(ncol = 1),
+      width = 25,
+      height = 20,
+      units = "cm"
+    )
+  }
+)
+
+# filter
+sce_list <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    sce[, !sce$discard_final]
+  }
+)
+```
+
+```{r dim_red}
+# this is modified from montana anheart process.Rmd
+# todo: ask montana logic behind steps
+hvgs_sample <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    scran::modelGeneVar(
+      x = sce,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    ) |>
+      scran::getTopHVGs(n = 5000)
+  }
+)
+
+# should parallelize this?
+sce_list <- imap(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce, i) {
+    # default calc is 50
+    sce <- scater::runPCA(
+      x = sce,
+      ncomponents = 50,
+      subset_row = hvgs_sample[[i]],
+      BSPARAM = BiocSingular::IrlbaParam(),
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    )
+    # estimate dims
+    dim_est <- intrinsicDimension::maxLikGlobalDimEst(
+      data = reducedDims(sce)$PCA,
+      k = 50,
+      unbiased = TRUE
+    ) |>
+      unlist() |>
+      unname() |>
+      round()
+
+    # this will (always) be lower than 50
+    # redundant? just call runPCA with dim_est?
+    # print(dim_est)
+    max_dims <- min(50, dim_est)
+
+    # modify in place
+    reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[, 1:max_dims]
+
+    sce <- scater::runUMAP(
+      x = sce,
+      dimred = "PCA",
+      ncomponents = max_dims,
+      n_neighbors = 15,
+      spread = 3,
+      min_dist = 0.05,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    )
+    # tsne here if wanted
+    # return
+    sce
+  }
+)
+```
+
+```{r cluster}
+cluster_list <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    clusters <- scran::clusterCells(
+      x = sce,
+      use.dimred = "PCA",
+      BLUSPARAM = bluster::NNGraphParam(
+        k = 15,
+        type = "rank",
+        cluster.fun = "louvain"
+      ),
+      # BPPARAM = MulticoreParam(
+      #   workers = length(parallelly::availableWorkers())
+      # )
+    )
+  }
+)
+
+sce_list <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    colData(sce)$cluster <- cluster_list[[i]]
+    # return
+    sce
+  }
+)
+
+cluster_plots <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    plot_umap_coldata(
+      obj = sce,
+      coldata = "cluster",
+      sample_name = i,
+      width = 10,
+      height = 10,
+      units = "cm"
+    )
+  }
+)
+# save
+iwalk(
+  .x = sample_list,
+  .f = function(x, i) {
+    ggsave(
+      filename =
+        here("output", "plots", "2_cluster", paste0(i, "_cluster.pdf")),
+      plot = cluster_plots[x] |>
+        patchwork::wrap_plots(ncol = 4),
+      width = 50,
+      height = 50,
+      units = "cm"
+    )
+    # trim
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "2_cluster", paste0(i, "_cluster.pdf")),
+        here("output", "plots", "2_cluster", paste0(i, "_cluster.pdf"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r markers}
+# library(furrr)
+# plan(multisession, workers = length(parallelly::availableWorkers()))
+# options(future.globals.maxSize = 5000 * 1024^2)
+marker_list <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    list <- scran::findMarkers(
+      x = sce,
+      groups = sce$cluster,
+      test.type = "wilcox",
+      pval.type = "all"
+    ) |>
+      as.list()
+
+    map(
+      .x = list,
+      .f = function(x) {
+        x |>
+          as_tibble(rownames = "gene_id") |>
+          left_join(
+            y = rowData(sce) |>
+              as_tibble() |>
+              select(gene_id, gene_name),
+            by = "gene_id"
+          ) |>
+          relocate(gene_name, .after = gene_id)
+      }
+    )
+  }
+)
+
+marker_plots <- map(
+  .progress = TRUE,
+  .x = names(sce_list),
+  .f = function(x) {
+    expr_plots <- map(
+      .x = 1:length(unique(sce_list[[x]]$cluster)),
+      .f = function(y) {
+        top_genes_to_plot <- marker_list[[x]][[y]] |>
+          head(9) |>
+          select(gene_id, gene_name)
+
+        p <- scater::plotExpression(
+          object = sce_list[[x]],
+          features = top_genes_to_plot$gene_id,
+          x = "cluster",
+          colour_by = "cluster"
+        ) +
+          theme(
+            # aspect.ratio = 1,
+            axis.title.y = element_blank(),
+            legend.position = "none",
+            plot.title = element_text(face = "plain")
+          ) +
+          ggtitle(label = paste("cluster", y)) +
+          ggh4x::facet_wrap2(
+            drop = FALSE,
+            ~Feature,
+            labeller = as_labeller(
+              # named vector
+              deframe(top_genes_to_plot)
+            )
+          )
+        # p <- egg::set_panel_size(
+        #   p,
+        #   width = unit(2.5, "cm"),
+        #   height = unit(2.5, "cm")
+        #   ) |>
+        # ggplotify::as.ggplot()
+        p
+      }
+    )
+    umap_plot <- scater::plotReducedDim(
+      object = sce_list[[x]],
+      dimred = "UMAP",
+      colour_by = "cluster"
+    ) +
+      theme(
+        # aspect.ratio = 1,
+        legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(face = "plain")
+      ) +
+      ggtitle(label = x)
+
+    # align
+    # patchwork::wrap_plots(
+    append(
+      list(umap_plot),
+      expr_plots
+    )
+    # )
+  }
+) |>
+  set_names(names(sce_list)) |>
+  # this feels jank
+  # separate because this takes time - why??
+  map(
+    .progress = TRUE,
+    # .x = marker_plots,
+    .f = function(plots) {
+      p <- plots |>
+        # align
+        patchwork::wrap_plots(ncol = 4) |>
+        # now the aligned plot is single plot and loses facets
+        ggplotify::as.ggplot()
+      # calc n_rows for final plot size
+      n_rows <- ceiling(
+        length(plots) / 4
+      )
+      p + ggh4x::force_panelsizes(
+        rows = unit(x = n_rows * 15, "cm"),
+        cols = unit(60, "cm")
+      )
+    }
+  )
+# save
+iwalk(
+  .progress = TRUE,
+  .x = marker_plots,
+  .f = function(x, i) {
+    ggsave(
+      plot = x,
+      filename =
+        here("output", "plots", "3_markers", paste0(i, "_marker_genes", ".pdf")),
+      device = cairo_pdf,
+      width = 100,
+      height = 100,
+      units = "cm"
+    )
+    # trim
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "3_markers", paste0(i, "_marker_genes", ".pdf")),
+        here("output", "plots", "3_markers", paste0(i, "_marker_genes", ".pdf"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r annotate}
+if (annotate_data) {
+  # start with refs
+  # load each reference
+  ref_list <- load_ref_list()
+
+  hvgs_reference <- map(
+    .x = ref_list,
+    .f = function(ref) {
+      scran::modelGeneVar(
+        x = ref,
+        # gotta go fast
+        BPPARAM = MulticoreParam(
+          workers = length(parallelly::availableWorkers()) / length(ref_list)
+        )
+      ) |>
+        scran::getTopHVGs(n = 5000)
+    }
+  )
+
+  # let us generalise
+  annotation_tib <- crossing(
+    names(sce_list),
+    names(ref_list)
+  ) |>
+    rename(test = 1, ref = 2)
+
+  # justin
+  gc()
+
+  # could make this faster if we wanted?
+  pred <- pmap(
+    .progress = TRUE,
+    .l = list(
+      test = annotation_tib$test,
+      ref = annotation_tib$ref
+    ),
+    .f = function(test, ref) {
+      # intersect genes
+      test_sce <- sce_list[[test]]
+      ref_sce <- ref_list[[ref]]
+      gene_intersect <- intersect(
+        x = rownames(test_sce),
+        y = rownames(ref_sce)
+      )
+      # intersect hvgs
+      hvgs_test <- hvgs_sample[[test]]
+      hvgs_ref <- hvgs_reference[[ref]]
+      hvgs_intersect <- intersect(
+        x = hvgs_test,
+        y = hvgs_ref
+      )
+
+      anno <- case_when(
+        ref == "couturier" ~ "cluster",
+        ref == "ruiz_moreno" ~ "annotation_level_3"
+      )
+
+      # run
+      SingleR::SingleR(
+        test = test_sce[gene_intersect, ],
+        ref = ref_sce[gene_intersect, ],
+        restrict = hvgs_intersect,
+        labels = colData(ref_sce)[, anno],
+        de.method = "wilcox",
+        # gotta go fast
+        BPPARAM = MulticoreParam(
+          workers = length(parallelly::availableWorkers())
+        )
+      )
+    }
+  )
+
+  annotation_tib <- annotation_tib |>
+    mutate(
+      pred_tib = map(
+        .x = pred,
+        .f = as_tibble, rownames = "barcode"
+      )
+    )
+
+  saveRDS(
+    object = annotation_tib,
+    file = here("data", "processed", "annotation_tib.rds")
+  )
+} else if (file.exists(here("data", "processed", "annotation_tib.rds"))) {
+  annotation_tib <- readRDS(
+    file = here("data", "processed", "annotation_tib.rds")
+  )
+}
+
+# extract all labels into list
+annotate_label_list <- map(
+  .x = unique(annotation_tib$test),
+  .f = function(test) {
+    ref <- annotation_tib |>
+      filter(test == !!test) |>
+      pull(ref)
+    # nested jank
+    map(
+      .x = unique(ref),
+      .f = function(ref_unique) {
+        annotation_tib |>
+          filter(
+            test == !!test,
+            ref == !!ref_unique
+          ) |>
+          unnest(cols = "pred_tib") |>
+          select(barcode, pruned.labels) |>
+          rename(
+            !!paste0(ref_unique, "_labels") := pruned.labels
+          )
+      }
+    ) |>
+      reduce(.f = left_join, by = "barcode")
+  }
+) |>
+  set_names(nm = names(sce_list))
+
+# add in
+sce_list <- imap(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce, i) {
+    colData(sce) <- colData(sce) |>
+      as_tibble(rownames = "barcode") |>
+      left_join(
+        y = annotate_label_list[[i]],
+        by = "barcode"
+      ) |>
+      DataFrame()
+    sce
+  }
+)
+
+# new colours
+# brain lab wiki doesn't include all
+new_annotation_colours <- Polychrome::createPalette(
+  N = bind_rows(annotate_label_list) |>
+    pivot_longer(cols = -barcode, values_to = "annotation") |>
+    pull(annotation) |>
+    unique() |>
+    length(),
+  seedcolors = c("#ff0000", "#00ff00", "#0000ff")
+) |>
+  set_names(
+    bind_rows(annotate_label_list) |>
+      pivot_longer(cols = -barcode, values_to = "annotation") |>
+      pull(annotation) |>
+      unique()
+  )
+
+# quick looksie
+walk(
+  .x = c("couturier_labels", "ruiz_moreno_labels"),
+  .f = function(label) {
+    map(
+      .x = sample_list,
+      .f = function(sample) {
+        # we need to go deeper
+        map(
+          .x = sample,
+          .f = function(i) {
+            p <- plot_umap_coldata(
+              obj = sce_list[[i]],
+              coldata = label,
+              sample_name = i,
+              colours = new_annotation_colours,
+              width = 7.5,
+              height = 7.5,
+              units = "cm"
+            )
+            # title append
+            p + ggtitle(
+              label = paste(
+                i,
+                p$labels$title,
+                sep = "\n"
+              )
+            )
+          }
+        ) |>
+          patchwork::wrap_plots(nrow = 1)
+      }
+    ) |>
+      patchwork::wrap_plots(ncol = 1) |>
+      ggsave(
+        filename =
+          here("output", "plots", "3_raw_anno", paste0("raw_", label, ".pdf")),
+        device = cairo_pdf,
+        width = 50,
+        height = 50,
+        units = "cm"
+      )
+    # trim
+    system2(
+      command = "pdfcrop",
+      args = c(
+        here("output", "plots", "3_raw_anno", paste0("raw_", label, ".pdf")),
+        here("output", "plots", "3_raw_anno", paste0("raw_", label, ".pdf"))
+      ),
+      stdout = NULL
+    )
+  }
+)
+```
+
+```{r final_annotation}
+map(
+  # .x = sce_list[str_detect(string = names(sce_list), pattern = "T")],
+  .x = sce_list,
+  .f = function(sce) {
+    plot_umap_coldata(
+      obj = sce,
+      coldata = "cluster",
+      sample_name = i,
+      width = 7.5,
+      height = 7.5,
+      units = "cm"
+    )
+  }
+)
+
+iwalk(
+  .x = sce_list[str_detect(string = names(sce_list), pattern = "T")],
+  # .x = sce_list,
+  .f = function(sce, i) {
+    imap(
+      .x = normal_sets_ms,
+      .f = function(x, j) {
+        # print(j)
+        # k <<- j
+        # assign(x = "j", value = j, envir = globalenv())
+        list(
+          plot_umap_coldata(
+            obj = sce,
+            coldata = "cluster",
+            sample_name = i,
+            width = 7.5,
+            height = 7.5,
+            units = "cm"
+          )
+        ) |>
+          append(
+            map(
+              .x = x,
+              .f = function(y) {
+                plot_umap_gene(
+                  obj = sce,
+                  gene_name = y,
+                  sample_name = i,
+                  width = 7.5,
+                  height = 7.5,
+                  units = "cm"
+                )
+              }
+            )
+          ) |>
+          patchwork::wrap_plots(ncol = 4) |>
+          ggsave(
+            filename =
+              here("output", "plots", "annotation", paste0(i, "_", j, ".pdf")),
+            device = cairo_pdf,
+            width = 75,
+            height = 75,
+            units = "cm"
+          )
+        system2(
+          command = "pdfcrop",
+          args = c(
+            here("output", "plots", "annotation", paste0(i, "_", j, ".pdf")),
+            here("output", "plots", "annotation", paste0(i, "_", j, ".pdf"))
+          ),
+          stdout = NULL
+        )
+      }
+    )
+  }
+)
+
+map(
+  .x = names(sce_list),
+  .f = function(x) {
+    # list(
+    #   plot_umap_coldata(
+    #     obj = sce_list[[x]],
+    #     coldata = "cluster",
+    #     sample_name = x,
+    #     width = 7.5,
+    #     height = 7.5,
+    #     units = "cm"
+    #   )
+    # ) |>
+    #   append(
+
+    map(
+      .x = 1:length(unique(sce_list[[x]]$cluster)),
+      .f = function(y) {
+        top_genes_to_plot <- marker_list[[x]][[y]] |>
+          head(5) |>
+          pull(gene_name)
+
+        list(
+          plot_umap_coldata(
+            obj = sce_list[[x]],
+            coldata = "cluster",
+            sample_name = x,
+            width = 7.5,
+            height = 7.5,
+            units = "cm"
+          )
+        ) |>
+          append(
+            map(
+              .x = top_genes_to_plot,
+              .f = function(gene) {
+                plot_umap_gene(
+                  obj = sce_list[[x]],
+                  gene_name = gene,
+                  sample_name = x,
+                  width = 7.5,
+                  height = 7.5,
+                  units = "cm"
+                )
+              }
+            )
+          ) |>
+          patchwork::wrap_plots(ncol = 6)
+      }
+    ) |>
+      patchwork::wrap_plots()
+  }
+)
+
+map(
+  .x = sce_list,
+  .f = function(sce) {
+
+  }
+)
+```
+
+```{r}
+scevan_res <- imap(
+  .progress = TRUE,
+  .x = sce_list[str_detect(string = names(sce_list), pattern = "T")],
+  .f = function(sce, i) {
+    try({
+      cat(i, "\n")
+      mat <- counts(sce) |>
+        as.matrix()
+      row.names(mat) <- rowData(sce)$gene_name
+      colnames(mat) <- sce$barcode
+      mat <- mat[!duplicated(row.names(mat)), ]
+
+      # return
+      SCEVAN::pipelineCNA(
+        # let's not focus on this now
+        # just interested in what is non-malignant
+        SUBCLONES = FALSE,
+        count_mtx = mat,
+        sample = i,
+        beta_vega = 0.75,
+        par_cores = length(parallelly::availableWorkers()) / length(sce_list) |>
+          floor()
+      )
+    })
+  }
+)
+```
+
+```{r population_proportions}
+# nested jank
+pop_prop_list <- map(
+  .x = sample_list,
+  .f = function(group) {
+    # across labels
+    imap(
+      .x = c("ruiz_moreno_labels", "couturier_labels"),
+      .f = function(label, i) {
+        # per sample
+        imap(
+          .x = group,
+          .f = function(sample, i) {
+            colData(sce_list[[sample]]) |>
+              as_tibble() |>
+              pull(label) |>
+              table() |>
+              prop.table() |>
+              enframe(name = label, value = "percent") |>
+              mutate(sample = sample)
+          }
+        ) |>
+          set_names(group) |>
+          bind_rows()
+      }
+    ) |>
+      set_names(c("ruiz_moreno_labels", "couturier_labels"))
+  }
+)
+# plot
+imap(
+  .x = pop_prop_list,
+  .f = function(group, i) {
+    imap(
+      .x = group,
+      .f = function(tib, j) {
+        tib %>%
+          ggplot(
+            aes(
+              x = sample,
+              y = as.numeric(percent),
+              fill = !!ensym(j)
+            )
+          ) +
+          geom_bar(
+            position = "stack",
+            stat = "identity"
+          ) +
+          ggtitle(
+            label = paste(
+              i,
+              j,
+              sep = "\n"
+            )
+          ) +
+          scale_fill_manual(values = new_annotation_colours)
+      }
+    )
+  }
+)
+
+# plot
+butt_list <- imap(
+  .x = pop_prop_list,
+  .f = function(group, i) {
+    imap(
+      .x = group,
+      .f = function(tib, j) {
+        tib1 <- map(
+          .x = c("PDN", "PDO", "T"),
+          .f = function(x) {
+            tib |>
+              filter(
+                str_detect(
+                  string = sample,
+                  pattern = x
+                )
+              ) |>
+              select(all_of(j), percent) |>
+              rename(
+                !!paste0(j, "_", i, "_", x) := percent
+              )
+          }
+        ) |>
+          reduce(.f = full_join, by = j)
+
+        # pairwise all
+        pairs <- expand.grid(
+          names(tib1)[map_lgl(tib1, is.numeric)],
+          names(tib1)[map_lgl(tib1, is.numeric)]
+        ) |>
+          filter(Var1 != Var2)
+
+        map2(
+          .x = pairs$Var1,
+          .y = pairs$Var2,
+          function(x, y) {
+            as_tibble_col(
+              x = tib1[[x]] - tib1[[y]],
+              column_name = str_c(x, "_minus_", y)
+            )
+          }
+        ) %>%
+          bind_cols(tib1, .)
+      }
+    )
+  }
+)
+
+map(
+  .x = butt_list,
+  .f = function(label) {
+    map(
+      .x = label,
+      .f = function(tib) {
+        selected_cols <- map_lgl(
+          .x = str_split(
+            string = names(tib),
+            pattern = "_minus_"
+          ),
+          .f = function(x) {
+            # columns with no comparisons
+            if (length(x) < 2) {
+              return(FALSE)
+            }
+            # tissue minus interest
+            all(
+              str_detect(string = x[[1]], pattern = "T"),
+              str_detect(string = x[[2]], pattern = "PDN|PDO")
+            )
+          }
+        )
+        # labels in first column
+        selected_cols[1] <- TRUE
+        tib <- tib[selected_cols]
+
+        # plot
+        tib |>
+          pivot_longer(cols = -1) |>
+          mutate(
+            name = str_sub(string = name, start = -10)
+          ) |>
+          rename(label = 1) |>
+          ggplot(
+            aes(
+              x = as.numeric(value),
+              y = fct(label, levels = names(new_annotation_colours)),
+              colour = label,
+              fill = name
+            )
+          ) +
+          geom_bar(
+            na.rm = TRUE,
+            position = "dodge",
+            stat = "identity"
+          ) +
+          scale_colour_manual(values = new_annotation_colours) +
+          theme(aspect.ratio = 1)
+      }
+    )
+  }
+)
+```
+
+```{r cellsnp}
+# sort
+# rehead
+# cellsnp
+```
+
+```{r numbat}
+```

@@ -1,0 +1,2780 @@
+---
+title: "plots"
+author: "zm"
+date: "2024-11-06"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(here)
+library(Seurat)
+library(tidyverse)
+
+plots <- vector(mode = "list")
+
+# load(here("data/intermed/workspace.rds"))
+```
+
+```{r violin_ki67}
+
+a <- VlnPlot(
+  object = seurat_all_joined_filtered_tumour,
+  features = c(
+    "ENSG00000148773" # mki67
+    # "ENSG00000131747"  # top2a
+  ),
+  # cols = params$type_colours,
+  group.by = "line",
+  split.by = "type",
+  log = FALSE,
+  pt.size = 0,
+  alpha = 0.5
+) + 
+  scale_fill_manual(values = rep("white", 3)) + 
+  guides(fill = guide_legend(override.aes = list()))
+
+a[[1]]$layers[[1]] <- NULL
+
+
+plots$mki67_vln <- a + 
+  # geom_violin(position = "dodge", fill = "white") +
+  geom_jitter(
+    mapping = aes(color = split, fill = split), 
+    data = a$data, 
+    position = position_jitterdodge(jitter.width = 0.4, dodge.width = 0.9),
+    size = 0.1,
+    shape = 21,
+    show.legend = FALSE
+    ) + 
+  scale_fill_manual(values = params$type_colours) + 
+   scale_colour_manual(values = params$type_colours) + 
+  ggtitle("MKI67") + 
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  theme(
+    plot.title = element_text(face = "italic"),
+    aspect.ratio = 1,
+    axis.title.x = element_blank()
+  )
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/violin_ki67.pdf"),
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/violin_ki67.pdf"),
+    here("output/snrnaseq/plots/violin_ki67.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r mde_all}
+library(SingleCellExperiment)
+EnvironmentModules::module_load("openssl")
+BiocManager::install("zellkonverter", force = TRUE, ask = FALSE, update = FALSE)
+sce_integrated <- zellkonverter::readH5AD(here("data/intermed/snrnaseq/scvi_all_integrated.h5ad"))
+rownames(sce_integrated) <- rowData(sce_integrated)$var.features
+scater::plotReducedDim(sce_integrated, "X_scVI_MDE", colour_by = "leiden", text_by = "leiden")
+
+ptprc_data <- seurat_all_joined@assays$RNA$data["ENSG00000081237", ] |>
+  enframe(name = "bc_wells", value = "PTPRC")
+mbp_data <- seurat_all_joined@assays$RNA$data["ENSG00000197971", ] |>
+  enframe(name = "bc_wells", value = "MBP")
+
+plots$mde_mbp <- reducedDim(sce_integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_wells") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(ptprc_data) |>
+  left_join(mbp_data) |>
+  bind_cols(as_tibble_col(sce_integrated$leiden, column_name = "leiden")) |>
+  mutate(
+    ellipse = case_when(
+      leiden == 23 & MDE_1 < -2 ~ "oligo",
+      # leiden == 15 & MDE_2 < -2 & MDE_1 < 0 & MDE_1 > -1 ~ "immune"
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1, y = MDE_2, colour = MBP
+    )
+  ) +
+  geom_point(size = 2, key_glyph = "rect") +
+  scale_colour_viridis_c() +
+  ggforce::geom_mark_ellipse(
+    inherit.aes = FALSE,
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      group = ellipse,
+      # colour = Ellipse,
+      filter = !is.na(ellipse)
+    ),
+    colour = "black",
+    expand = unit(2, "mm")
+  ) +
+  guides(
+    colour = guide_colourbar(title = expression(italic("MBP"))),
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+plots$mde_ptprc <- reducedDim(sce_integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_wells") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(ptprc_data) |>
+  left_join(mbp_data) |>
+  bind_cols(as_tibble_col(sce_integrated$leiden, column_name = "leiden")) |>
+  mutate(
+    ellipse = case_when(
+      # leiden == 23 & MDE_1 < -2 ~ "oligo",
+      leiden == 22 & MDE_2 < -1.5 & MDE_1 < 0 ~ "immune"
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1, y = MDE_2, colour = PTPRC
+    )
+  ) +
+  geom_point(size = 2, key_glyph = "rect") +
+  scale_colour_viridis_c() +
+  ggforce::geom_mark_ellipse(
+    inherit.aes = FALSE,
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      group = ellipse,
+      # colour = Ellipse,
+      filter = !is.na(ellipse)
+    ),
+    colour = "black",
+    expand = unit(2, "mm")
+  ) +
+  guides(
+    colour = guide_colourbar(title = expression(italic("PTPRC"))),
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+plots$mde_line <- reducedDim(sce_integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  sample_frac() |> 
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_integrated) |> as_tibble(rownames = "bc_well")) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  # filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = Line,
+      fill = Line,
+      # shape = type
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = params$line_colours) +
+  scale_fill_manual(values = params$line_colours) +
+  # scale_shape_manual(values = params$type_shapes) +
+  guides(
+    colour = guide_legend(title = "Line"),
+    shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    aspect.ratio = 1,
+    legend.key.spacing.y = unit(0.1, "cm"),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    legend.key = element_rect(colour = "black", linewidth = 0.1),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+plots$mde_type <- reducedDim(sce_integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  sample_frac() |> 
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_integrated) |> as_tibble(rownames = "bc_well")) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  # filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = type,
+      fill = type,
+      # shape = type
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = params$type_colours) +
+  scale_fill_manual(values = params$type_colours) +
+  # scale_shape_manual(values = params$type_shapes) +
+  guides(
+    fill = guide_legend(title = "Type"),
+    colour = guide_legend(title = "Type"),
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    aspect.ratio = 1,
+    legend.key.spacing.y = unit(0.1, "cm"),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    legend.key = element_rect(colour = "black", linewidth = 0.1),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+plots$mde_class <- reducedDim(sce_integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(seurat_all_joined@meta.data |> as_tibble(rownames = "bc_well")) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  mutate(
+    Class = case_when(
+      line == "GL0128" & numbat_clone == 1 ~ "Non Malignant",
+      numbat_filtered == TRUE ~ "Non Malignant",
+      .default = "Malignant"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1, y = MDE_2, colour = Class, fill = Class
+    )
+  ) +
+  geom_point(size = 2, key_glyph = "rect") +
+  scale_colour_manual(values = c("#e84d60", "#77c298")) +
+  scale_fill_manual(values = c("#e84d60", "#77c298")) +
+  # guides(
+  #   fill = guide_legend(title = "Class"),
+  #   # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  # ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.key.spacing.y = unit(0.1, "cm"),
+    legend.key = element_rect(colour = "black", linewidth = 0.1),
+    aspect.ratio = 1,
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+patchwork::wrap_plots(
+  plots$mde_all,
+  plots$mde_class,
+  axes = "collect"
+)
+
+ggsave(
+  filename = here("output/snrnaseq/plots/mde.pdf"),
+  width = 25,
+  height = 15,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mde.pdf"),
+    here("output/snrnaseq/plots/mde.pdf")
+  ),
+  stdout = NULL
+)
+
+patchwork::wrap_plots(
+  plots$mde_ptprc,
+  plots$mde_mbp,
+  ncol = 1,
+  axes = "collect",
+  guides = "keep"
+)
+ggsave(
+  filename = here("output/snrnaseq/plots/mde_norm.pdf"),
+  width = 25,
+  height = 15,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mde_norm.pdf"),
+    here("output/snrnaseq/plots/mde_norm.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r alluvial_normal}
+library(ggalluvial)
+
+# rownames(seurat_all_joined@meta.data) <- seurat_all_joined@meta.data$bc_wells
+# UMAPPlot(seurat_all_joined, group.by = c("numbat_filtered", "type"))
+
+# seurat_all_joined@meta.data[seurat_all_joined$seurat_clusters %in% c(7, 9, 17, 19, 26), ]
+# rownames(seurat_line$GL0095@meta.data) <- seurat_line$GL0095@meta.data$bc_wells
+# UMAPPlot(seurat_line$GL0095, group.by = c("numbat_clone", "type", "new_label.ruiz"))
+
+seurat_all_joined@meta.data$new_label.ruiz <- seurat_all_joined@meta.data$new_label.ruiz.x
+
+allu_data <- seurat_all_joined@meta.data |>
+  as_tibble() |>
+  # left_join(seurat_all@meta.data |> as_tibble()) |>
+  mutate(type = case_when(type == "T" ~ "TIS", .default = type)) |>
+  # mutate(
+  #   new_label.ruiz = case_when(
+  #     new_label.ruiz %in% c("OPC") ~ "Oligodendrocyte",
+  #     .default = new_label.ruiz
+  #   )
+  # ) |>
+  mutate(
+    new_label.ruiz = case_when(
+      seurat_clusters == 17 ~ "Immune",
+      .default = new_label.ruiz
+    )
+  ) |>
+  filter(numbat_filtered == TRUE) |>
+  # filter(seurat_clusters %in% c(7, 9, 17, 19, 26)) |>
+  # filter(new_label.ruiz != "Immune" & numbat_p < 0.95 | new_label.ruiz == "Immune")
+  select(new_label.ruiz, line, type) |>
+  # filter(line != "GL0128") |>
+  drop_na() |>
+  group_by(across(everything())) |>
+  summarise(freq = n()) |>
+  ungroup() |>
+  filter(freq >= 3) |>
+  to_lodes_form(axes = 1:3)
+
+plots$alluvial <- allu_data |>
+  ggplot(
+    mapping = aes(
+      x = x,
+      y = freq,
+      stratum = stratum,
+      alluvium = alluvium
+    )
+  ) +
+  geom_flow(aes(fill = stratum), alpha = 0.75) +
+  geom_stratum(aes(fill = stratum), width = 0.33, alpha = 1) +
+  scale_fill_manual(
+    values = c(
+      params$annotation_colours,
+      params$line_colours,
+      params$type_colours
+    )
+  ) +
+  scale_x_discrete(expand = c(0, 0), labels = c("Annotation", "Line", "Type")) + 
+  scale_y_continuous(
+    expand = c(0, 0),
+    # limits = c(0, 1.1 * sum(allu_data$freq)/3),
+    name = "Individual Nuclei"
+  ) + 
+  ggrepel::geom_text_repel(
+    aes(
+      label = ifelse(
+        stratum %in% c("Endothelial", "Mural cell", "Neutrophil"),
+        as.character(stratum),
+        NA
+      )
+    ),
+    stat = "stratum",
+    direction = "x",
+    nudge_x = 0.5
+  )  + 
+  ggrepel::geom_text_repel(
+    aes(
+      label = ifelse(
+        stratum %in% "PDN",
+        as.character(stratum),
+        NA
+      )
+    ),
+    stat = "stratum",
+    direction = "both",
+    nudge_x = 0.5
+  ) + 
+  ggrepel::geom_text_repel(
+    aes(
+      label = ifelse(
+        stratum %in% "Oligodendrocyte",
+        as.character(stratum),
+        NA
+      )
+    ),
+    stat = "stratum",
+    direction = "both",
+    nudge_x = 0.5
+  ) + 
+  ggrepel::geom_text_repel(
+    aes(
+      label = ifelse(
+        stratum %in% "GL0028",
+        as.character(stratum),
+        NA
+      )
+    ),
+    stat = "stratum",
+    direction = "x",
+    nudge_x = 0.5
+  ) + 
+  # geom_label(
+  #   aes(label = ifelse(stratum == "Neuron", as.character(stratum), NA)),
+  #   stat = "stratum",
+  #   direction = "y",
+  #   nudge_y = 0,
+  #   colour = params$annotation_colours["Neuron"]
+  # ) +
+  geom_text(
+    aes(
+      label = ifelse(
+        !stratum %in% c("Endothelial", "Mural cell", "Neutrophil", "GL0028", "PDN", "Oligodendrocyte"),
+        as.character(stratum),
+        NA
+      )
+    ),
+    colour = ifelse(unique(allu_data$stratum) == "GL0028", "white", "black"),
+    stat = "stratum"
+  ) +
+  # geom_text(aes(label = after_stat(stratum)), stat = "stratum") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size = 10),
+    text = element_text(size = 10),
+    panel.background = element_rect(fill = "white")
+  )
+plots$alluvial
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/normal_alluvial.pdf"),
+  width = 30,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/normal_alluvial.pdf"),
+    here("output/snrnaseq/plots/normal_alluvial.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r 128_umap}
+seurat_line$GL0128 <- RunUMAP(seurat_line$GL0128, dims = 1:30, seed.use = 42)
+dat <- Embeddings(object = seurat_line$GL0128[["umap"]])
+dat <- dat |>
+  as_tibble(rownames = "bc_wells") |>
+  dplyr::rename(UMAP_1 = umap_1, UMAP_2 = umap_2) |>
+  left_join(seurat_line$GL0128@meta.data |> as_tibble()) |>
+  left_join(seurat_all_joined@meta.data |> as_tibble() |> select(bc_wells, numbat_filtered)) |>
+  mutate(clone = case_when(
+    numbat_clone == 1 ~ "Non Malignant",
+    numbat_clone == 2 ~ "Subclone 1",
+    numbat_clone == 3 ~ "Subclone 2"
+  )) |>
+  mutate(
+    type_locs = case_when(
+      UMAP_1 < -10 ~ "PDN",
+      UMAP_1 > 2.5 & UMAP_2 < -2.5 ~ "TIS",
+      .default = "PDO"
+    )
+  )
+hull <- dat %>%
+  group_by(type_locs) %>%
+  slice(c(
+    chull(UMAP_1, UMAP_2),
+    chull(UMAP_1, UMAP_2)[1]
+  ))
+
+clone_colours <- c("#77c298", ggplot2_colours(n = 9)[1:2]) |> set_names(c("Non Malignant", "Subclone 1", "Subclone 2"))
+
+plots$umap_128 <- dat |>
+  sample_frac() |> 
+  ggplot(
+    mapping = aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      colour = clone,
+      fill = clone,
+      # shape = type
+    )
+  ) +
+  geom_point(size = 2, key_glyph = "rect") +
+  geom_point() +
+  scale_fill_manual(values = clone_colours) +
+  ggforce::geom_shape(
+    inherit.aes = FALSE,
+    data = hull,
+    mapping = aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      colour = type_locs
+    ),
+    fill = NA,
+    expand = 0.045,
+    radius = 0.07,
+    linetype = "dashed"
+  ) +
+  scale_colour_manual(breaks = c("PDN", "PDO", "TIS"), values = c(params$type_colours, clone_colours)) +
+  guides(
+    # shape = guide_legend(title = "Type", override.aes = list(size = 3)),
+    fill = guide_legend(title = "Clone", override.aes = list(linewidth = 1, colour = "black", shape = NA)),
+    colour = guide_legend(title = "Type")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    # legend.key = element_rect(linewidth = 0.1),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+
+# plots$umap_128
+  # ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+```
+
+```{r ridge_state}
+plots$ridge_state <- seurat_all_joined@meta.data |>
+  as_tibble() |>
+  filter(!numbat_filtered) |>
+  filter(line != "GL0128") |>
+  select(bc_wells, sample, starts_with("scores.")) |>
+  pivot_longer(cols = -c(bc_wells, sample)) |>
+  mutate(
+    name = case_when(
+      name == "scores.Astro.x" ~ "AC-like",
+      name == "scores.Mesenchymal.x" ~ "MES-like",
+      name == "scores.Neuronal.x" ~ "NPC-like",
+      name == "scores.Oligo.x" ~ "OPC-like",
+      name == "scores.Progenitor.x" ~ "Progenitor",
+      name == "scores.Unassigned.x" ~ "Unassigned"
+    ),
+    line = str_sub(sample, end = 6),
+    type = str_sub(sample, start = 8),
+  ) |>
+  filter(!name %in% c("Unassigned")) |>
+  drop_na() |>
+  mutate(type = case_when(type == "T" ~ "TIS", .default = type)) |>
+  ggplot(
+    mapping = aes(
+      x = value,
+      y = name,
+      fill = type
+    )
+  ) +
+  ggridges::geom_density_ridges2(
+    panel_scaling = FALSE,
+    alpha = 0.5,
+    scale = 0.75,
+    bandwidth = 0.01,
+  ) +
+  facet_wrap(~line) +
+  guides(fill = guide_legend(title = "Type", override.aes = list(alpha = 1, linewidth = 0.1))) + 
+  scale_y_discrete(expand = c(0.01, 0.001), limits = rev) +
+  scale_fill_manual(values = params$type_colours) +
+  labs(y = "State", x = "Score") +
+  theme(
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+```
+
+```{r clone bar}
+plots$clone_bar <- seurat_all_joined@meta.data |>
+  as_tibble() |>
+  filter(!numbat_filtered) |>
+  # filter(line != "GL0128") |>
+  mutate(Sample = type, Line = line, State = labels.x) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  filter(!numbat_filtered) |>
+  filter(numbat_clone != 1) |>
+  mutate(numbat_clone = numbat_clone - 1) |>
+  mutate(numbat_clone = as.factor(numbat_clone)) |>
+  ggplot(
+    mapping = aes(
+      x = Sample,
+      # y = type,
+      fill = numbat_clone
+    )
+  ) +
+  geom_bar(position = "fill", colour = "black") +
+  # geom_bar(stat = "identity") +
+  facet_grid(~Line) +
+  # scale_fill_manual(values = params$annotation_colours) +
+  guides(
+    fill = guide_legend(title.position = "top", title = "Tumour Subclone", override.aes = list(colour = NA))
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0, 0)) +
+  ylab("Percent") +
+  theme(
+    # aspect.ratio = 3,
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+```
+
+```{r malignant_bar}
+plots$malignant_bar <- seurat_all_joined@meta.data |>
+  as_tibble() |>
+  # filter(!numbat_filtered) |>
+  # filter(line != "GL0128") |>
+  mutate(Sample = type, Line = line, State = labels.x) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    malignant = case_when(
+      line == "GL0128" & numbat_clone == 1 ~ "Non Malignant",
+      numbat_filtered == TRUE ~ "Non Malignant",
+      .default = "Malignant"
+    )
+  ) |>
+  # filter(!numbat_filtered) |>
+  # filter(numbat_clone != 1) |>
+  # mutate(numbat_clone = numbat_clone - 1) |>
+  # mutate(numbat_clone = as.factor(numbat_clone)) |>
+  ggplot(
+    mapping = aes(
+      x = Sample,
+      # y = type,
+      fill = malignant
+    )
+  ) +
+  geom_bar(position = "fill", colour = "black") +
+  # geom_bar(stat = "identity") +
+  facet_grid(~Line) +
+  # scale_fill_manual(values = params$annotation_colours) +
+  guides(
+    fill = guide_legend(title = "Class", override.aes = list(colour = NA))
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  scale_fill_manual(values = c("#e84d60", "#77c298")) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0, 0)) +
+  ylab("Percent") +
+  theme(
+    # aspect.ratio = 3,
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+```
+
+```{r}
+patchwork::wrap_plots(
+  patchwork::wrap_plots(
+    plots$malignant_bar + theme(legend.justification = "left"),
+    plots$clone_bar + theme(legend.justification = "left"),
+    ncol = 1,
+    axes = "collect",
+    guides = "keep"
+  ),
+  plots$umap_128 + labs(title = "GL0128")
+)
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/128_clone.pdf"),
+  width = 25,
+  height = 12.5,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/128_clone.pdf"),
+    here("output/snrnaseq/plots/128_clone.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r state_mde}
+plots$mde_tumour <- reducedDim(integrated, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_wells") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(
+    seurat_all_joined_tumour@meta.data |> as_tibble()
+  ) |>
+  mutate(
+    mde_annotation = case_when(
+      mde_annotation == "Astro" ~ "AC-like",
+      mde_annotation == "Mesenchymal" ~ "MES-like",
+      mde_annotation == "Neuronal" ~ "NPC-like",
+      mde_annotation == "Oligo" ~ "OPC-like",
+      .default = mde_annotation
+    )
+  ) |>
+  mutate(State = mde_annotation) |> 
+  ggplot(
+    mapping = aes(
+      x = MDE_1, y = MDE_2, colour = State
+    )
+  ) +
+  geom_point() +
+  guides(
+    # fill = guide_legend(title = "State", override.aes = list(colour = "black", size = 1)),
+    # colour = guide_legend(override.aes = list(colour = "black", size = 1))
+  ) +
+  scale_colour_manual(values = params$annotation_colours) +
+  # scale_fill_manual(values = params$annotation_colours) +
+  theme(
+    legend.key = element_rect(colour = "black", linewidth = 0.1),
+    legend.key.spacing.y = unit(0.1, 'cm'),
+    aspect.ratio = 1,
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.line.x = element_line(linewidth = 0.5, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  )
+```
+
+```{r state_bar}
+plots$state_bar <- seurat_all_joined_tumour@meta.data |>
+  as_tibble() |>
+  mutate(
+    mde_annotation = case_when(
+      mde_annotation == "Astro" ~ "AC-like",
+      mde_annotation == "Mesenchymal" ~ "MES-like",
+      mde_annotation == "Neuronal" ~ "NPC-like",
+      mde_annotation == "Oligo" ~ "OPC-like",
+      .default = mde_annotation
+    )
+  ) |> 
+  filter(!numbat_filtered) |>
+  # filter(line != "GL0128") |>
+  mutate(Sample = type, Line = line, State = mde_annotation) |>
+  
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  ggplot(
+    mapping = aes(
+      x = Sample,
+      # y = type,
+      fill = State
+    )
+  ) +
+  geom_bar(position = "fill") +
+  # geom_bar(stat = "identity") +
+  facet_grid(~Line) +
+  scale_fill_manual(values = params$annotation_colours) +
+  scale_x_discrete(guide = guide_axis(angle = 45)) + 
+  guides(
+    fill = guide_legend(title.position = "top", nrow = 2, title = "State", override.aes = list(colour = NA))
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0, 0)) +
+  ylab("Percent") +
+  theme(
+    aspect.ratio = 3,
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+```
+
+```{r}
+patchwork::wrap_plots(
+  plots$mde_tumour + theme(legend.position = "none"),
+  plots$state,
+  plots$ridge_state
+)
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/tumour_state.pdf"),
+  width = 30,
+  height = 12.5,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/tumour_state.pdf"),
+    here("output/snrnaseq/plots/tumour_state.pdf")
+  ),
+  stdout = NULL
+)
+
+seurat_all_joined_tumour@meta.data |>
+  as_tibble() |>
+  mutate(
+    mde_annotation = case_when(
+      mde_annotation == "Astro" ~ "AC-like",
+      mde_annotation == "Mesenchymal" ~ "MES-like",
+      mde_annotation == "Neuronal" ~ "NPC-like",
+      mde_annotation == "Oligo" ~ "OPC-like",
+      .default = mde_annotation
+    )
+  ) |> 
+  filter(!numbat_filtered) |>
+  filter(line != "GL0128") |>
+  mutate(Sample = type, Line = line, State = mde_annotation) |> 
+  group_by(type, line, mde_annotation) |> 
+  summarise(n = n()) |> 
+  mutate(perc = 100 * n/sum(n))
+```
+
+```{r phase_pie}
+plots$phase_pie <- seurat_all_joined_filtered_tumour@meta.data |>
+  as_tibble() |>
+  select(type, labels, Phase) |>
+  mutate(type = case_when(type == "T" ~ "TIS", .default = type)) |>
+  mutate(
+    labels = case_when(
+      labels == "Astro" ~ "AC-like",
+      labels == "Oligo" ~ "OPC-like",
+      labels == "Mesenchymal" ~ "MES-like",
+      labels == "Neuronal" ~ "NPC-like",
+      labels == "Unassigned" ~ "Unknown",
+      .default = labels
+    )
+  ) |>
+  filter(labels != "Unknown") |> 
+  drop_na() |>
+  group_by(type, labels, Phase) |>
+  summarise(count = n()) |>
+  mutate(perc = count / sum(count)) |>
+  # pivot_longer(
+  #   cols = c(G1, G2M, S),
+  #   names_to = "phase",
+  #   values_to = "value"
+  # ) |>
+  mutate(text = paste(round(perc, digits = 2) * 100, "%")) |>
+  ggplot(
+    mapping =
+      aes(x = "", y = perc, fill = Phase)
+  ) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  facet_grid(
+    rows = vars(type),
+    cols = vars(labels),
+    switch = "both"
+  ) +
+  # geom_text(
+  #   aes(label = text),
+  #   position = position_stack(vjust = 0.5),
+  #   show.legend = FALSE
+  # ) +
+  guides(fill = guide_legend(title = "Phase")) +
+  # facet_wrap(~ellipse) +
+  theme(
+    aspect.ratio = 1,
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.spacing.x = unit(0, "lines"),
+    panel.spacing.y = unit(0, "lines"),
+    panel.background = element_rect(fill = "white", colour = NA),
+    strip.text.y.left = element_text(angle = 0),
+    strip.background = element_rect(fill = "white", colour = NA),
+  )
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/phase_pie.pdf"),
+  width = 25,
+  height = 12.5,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/phase_pie.pdf"),
+    here("output/snrnaseq/plots/phase_pie.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r gsea_g2m}
+q <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = broad_de_list$PDN_TIS |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_name, rank) |>
+    arrange(rank) |>
+    drop_na() |>
+    deframe()
+)
+r <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = broad_de_list$PDO_TIS |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_name, rank) |>
+    arrange(rank) |>
+    drop_na() |>
+    deframe()
+)
+dat <- bind_rows(
+  bind_rows(
+    q$ticks |> as_tibble() |> mutate(sample = "b"),
+    r$ticks |> as_tibble() |> mutate(sample = "c")
+  ) |> mutate(type = "ticks"),
+  bind_rows(
+    q$stats |> as_tibble() |> mutate(sample = "b"),
+    r$stats |> as_tibble() |> mutate(sample = "c")
+  ) |> mutate(type = "stats")
+)
+min_enrich <- min(q$curve$ES, r$curve$ES)
+
+plots$gsea_both_g2m <-dat %>%
+  ggplot() +
+  geom_line(
+    data = q$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = params$type_colours["PDN"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "b"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.05,
+      colour = sample
+    ),
+    size = 0.2,
+    color = params$type_colours["PDN"]
+  ) +
+  geom_line(
+    data = r$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = params$type_colours["PDO"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "c"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich - 0.05,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.1,
+      colour = sample
+    ),
+    size = 0.2,
+    color = params$type_colours["PDO"]
+  ) + 
+geom_hline(yintercept = min_enrich) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "<span style='font-size:10pt'>HALLMARK_G2M_CHECKPOINT</span>\n",
+      "<br>",
+      "<span style='color:#93AA00; font-size:10pt'>PDN vs. TIS, NES = ", 
+      broad_de_fgsea$PDN_TIS |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(NES) |> format(digits=3), 
+      ", adj.p =", 
+      broad_de_fgsea$PDN_TIS |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(padj) |> format(digits=2), 
+      "</span>\n",
+      "<br>",
+      "<span style='color:#00B9E3; font-size:10pt'>PDO vs. TIS, NES = ",
+      broad_de_fgsea$PDO_TIS |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(NES) |> format(digits=3), 
+      ", adj.p =", 
+      broad_de_fgsea$PDO_TIS |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(padj) |> format(digits=2), 
+      "</span>\n",
+      sep = ""
+    )
+  ) +
+  theme(
+    # aspect.ratio = 1 / 2,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/both_gsea_g2m.pdf"),
+  width = 15,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/both_gsea_g2m.pdf"),
+    here("output/snrnaseq/plots/both_gsea_g2m.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r broad de}
+broad_de_list$PDO_TIS |>
+  as_tibble(rownames = "gene_id") |>
+  mutate(sig = case_when(
+    p_val_adj < 0.05 ~ TRUE
+  )) |>
+  # drop_na() |>
+  ggplot(
+    mapping = aes(
+      x = avg_log2FC,
+      y = -log10(p_val),
+      colour = sig
+    )
+  ) +
+  geom_point()
+
+plots$broad_volcano <- imap(
+  .x = broad_de_list,
+  .f = function(x, i) {
+    # big boilerplate energy
+    x <- x |>
+      as_tibble(rownames = "gene_id") |>
+      left_join(ensembl)
+
+    up_lfc <- x |>
+      filter(avg_log2FC > log2(1.5)) |>
+      drop_na(gene_name) |>
+      pull(gene_name)
+    down_lfc <- x |>
+      filter(avg_log2FC < -log2(1.5)) |>
+      drop_na(gene_name) |>
+      pull(gene_name)
+    up_sig_label <- x |>
+      filter(p_val_adj < 0.05 & avg_log2FC > log2(1.5)) |>
+      drop_na(gene_name) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+    down_sig_label <- x |>
+      filter(p_val_adj < 0.05 & avg_log2FC < -log2(1.5)) |>
+      drop_na(gene_name) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+
+    up_colour <- params$type_colours[{
+      str_split(i, "_")[[1]][[1]]
+    }]
+    down_colour <- params$type_colours[{
+      str_split(i, "_")[[1]][[2]]
+    }]
+    up_name <- str_split(i, "_")[[1]][[1]]
+    down_name <- str_split(i, "_")[[1]][[2]]
+
+    x <- x |>
+      mutate(
+        sig = case_when(
+          gene_name %in% up_lfc & p_val_adj < 0.05 ~ "up_sig",
+          gene_name %in% down_lfc & p_val_adj < 0.05 ~ "down_sig"
+        )
+      ) |>
+      mutate(
+        colour_point = case_when(
+          sig == "up_sig" ~ up_colour,
+          sig == "down_sig" ~ down_colour,
+          .default = "grey"
+        )
+      ) |>
+      mutate(
+        label_point = case_when(
+          gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+          .default = NA_character_
+        )
+      ) |>
+      drop_na(gene_name)
+
+    title_up <- paste0(
+      "<span style='color:", up_colour, ";'>Up in ", up_name, " &rarr;</span>"
+    )
+    title_down <- paste0(
+      "<span style='color:", down_colour, ";'> &larr; Up in ", down_name, "</span>"
+    )
+
+    library(ggtext)
+    # plot
+    x |>
+      ggplot(
+        aes(
+          x = avg_log2FC,
+          y = -log10(p_val),
+          colour = colour_point,
+          label = label_point,
+          # shape = is_de_fdr_0.05
+        )
+      ) +
+      geom_point(show.legend = FALSE) +
+      scale_colour_identity() +
+      labs(
+        # y = "Bayes Factor",
+        x = expression("log"[2] * "FC")
+      ) +
+      theme(
+        aspect.ratio = 1,
+        panel.background = element_rect(fill = NA, colour = "black"),
+        panel.grid = element_line(colour = "grey90"),
+        # plot.title = element_text(hjust = 0.5)
+        plot.title = ggtext::element_markdown(hjust = 0.5, size = 10)
+      ) +
+      geom_hline(
+        yintercept = x |> filter(p_val_adj < 0.05) |> pull(p_val) |> max() %>%
+          {
+            -log10(.)
+          },
+        linetype = "dashed"
+      ) +
+      geom_vline(
+        xintercept = c(-log2(1.5), log2(1.5)),
+        linetype = "dashed"
+      ) +
+      coord_fixed(clip = "off") +
+      # ggtitle(
+      #   "Up in T Up in PDN"
+      # ) +
+      annotate(
+        label = title_up,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 1
+      ) +
+      annotate(
+        label = title_down,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = -Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 0
+      ) +
+      labs(title = "", subtitle = "") +
+      # lims(
+      #   x = c(-max_lfc, max_lfc),
+      #   y = c(min_bayes, max_bayes)
+      # ) +
+      ggrepel::geom_label_repel(
+        max.overlaps = 25,
+        force = 2,
+        size = 8 / .pt,
+        fontface = "italic"
+      )
+  }
+)
+plots$broad_volcano$PDO_TIS
+
+library(ggtext)
+
+plots$pdn_up_broad <- broad_de_enrich$PDN_TIS$up$GO_Molecular_Function_2018 |> 
+  as_tibble() |> 
+  slice(1:20) |> 
+  mutate(Term = str_sub(Term, end = -14)) |> 
+  mutate(
+    Term = case_when(
+      nchar(Term) > 20 ~ paste0(str_sub(Term, 1, 37), "..."),
+      .default = Term
+    )
+  ) |> 
+  mutate(
+    count = map(Overlap, .f = function(x) {unlist( str_split(x, "/")[[1]][[1]] )})
+    ) |> 
+  mutate(count = as.numeric(unlist(count))) |> 
+  mutate(p_val = P.value) |> 
+  ggplot(
+    mapping = aes(
+      x = reorder(Term, -p_val), y = count, fill = -log10(p_val)
+    )
+  ) + 
+  geom_bar(stat = "identity") + 
+  coord_flip(clip = "off") + 
+  scale_fill_viridis_c() + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0, 0)) + 
+  xlab("GO Term") + 
+  ylab("Count") + 
+  # annotate(
+  #       label = "<span style='color:#93AA00;'>Up in PDN &rarr;</span>",
+  #       geom = "richtext",
+  #       colour = NA,
+  #       # label.padding = unit(c(0, 0, 0, 0), "lines"),
+  #       x = Inf,
+  #       y = Inf,
+  #       vjust = 0.0,
+  #       hjust = 0
+  #     ) + 
+  ggtitle("<span style='color:#93AA00;'>Up in PDN &rarr;</span>") +
+  theme(
+    title = ggtext::element_markdown(),
+    text = element_text(size = 10),
+    panel.grid = element_line(colour = "black"),
+    panel.grid.major.y = element_blank(),
+    panel.background = element_rect(fill = "white", colour = "black", linewidth = 0.5)
+  ) 
+  # ggh4x::force_panelsizes(
+  #   rows = unit(6, "cm"),
+  #   cols = unit(3,  "cm")
+  # )
+
+patchwork::wrap_plots(
+  plots$broad_volcano$PDN_TIS,
+  plots$broad_volcano$PDO_TIS,
+  plots$pdn_up_broad,
+  nrow = 1
+)
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/broad_de.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/broad_de.pdf"),
+    here("output/snrnaseq/plots/broad_de.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+a <-  broad_de_list$PDN_TIS |> 
+    as_tibble(rownames = "gene_id") |>
+    # left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_id, rank) |>
+    arrange(rank) |>
+    drop_na() |> 
+    as.data.frame()
+b <- broad_de_list$PDO_TIS |> 
+    as_tibble(rownames = "gene_id") |>
+    # left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_id, rank) |>
+    arrange(rank) |>
+    drop_na() |>
+    as.data.frame()
+
+c <- intersect(a$gene_id, b$gene_id)
+
+a <- a |> filter(gene_id %in% c)
+b <- b |> filter(gene_id %in% c)
+# rrho <- RRHO::RRHO(a, b, alternative = "two.sided")
+rrho <- RRHO2::RRHO2_initialize(
+  list1 = a,
+  list2 = b,
+  # BY = TRUE,
+  # boundary = 0.1
+  # log10.ind = TRUE,
+  # stepsize = 50,
+  # alternative = "two.sided"
+  # method = "fisher"
+  multipleTesting = "none"
+)
+
+
+plots[["rrho"]] <- rrho$hypermat |>
+  as_tibble() |>
+  rownames_to_column(var = "var1") |>
+  pivot_longer(
+    cols = -var1, names_to = "var2", values_to = "value"
+  ) |>
+  mutate(
+    var1 = factor(var1, levels = 1:ncol(rrho$hypermat)),
+    var2 = factor(gsub("V", "", var2), levels = 1:ncol(rrho$hypermat))
+  ) |>
+  ggplot(
+    mapping =
+      aes(
+        x = var1,
+        y = var2,
+        fill = value
+      )
+  ) +
+  geom_tile() +
+  scale_fill_viridis_c(na.value = "white") +
+  labs(
+    x = "<span style='color:#FF61C3;'>&larr; Up in TIS</span>
+        <span style='color:#93AA00;'>Up in PDN &rarr;</span>",
+    y = "<span style='color:#FF61C3;'>&larr; Up in TIS</span>
+        <span style='color:#00B9E3;'>Up in PDO &rarr;</span>",
+    fill = expression("-log"[10] * "p")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_blank(),
+    axis.title.y = ggtext::element_markdown(vjust = 0.5),
+    axis.title.x = ggtext::element_markdown(hjust = 0.5),
+    axis.ticks = element_blank()
+  )
+plots$rrho
+```
+
+```{r dist}
+dist <- vroom::vroom(
+  file = here("data/intermed/snrnaseq/distances.csv")
+)
+
+colnames(dist) <- c("bc_wells", seurat_all_joined_filtered_tumour$bc_wells)
+dist <- dist |> select(-1)
+dist <- as.matrix(dist)
+rownames(dist) <- colnames(dist)
+
+col_data <- seurat_all_joined_tumour@meta.data |> 
+  as_tibble() |>
+  mutate(
+    line = str_sub(sample, end = 6),
+    type = str_sub(sample, start = 8)
+  )
+
+dist_list <- seurat_all_joined_tumour$mde_annotation |>
+  unique() |>
+  discard(is.na) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      filt_col_data <- col_data |>
+        filter(mde_annotation == x)
+
+      c("PDN", "PDO", "T") |>
+        set_names() |>
+        map(
+          .f = function(y) {
+            tis_wells <- filt_col_data |>
+              filter(type == "T") |>
+              pull(bc_wells)
+            ref_wells <- filt_col_data |>
+              filter(type == y) |>
+              pull(bc_wells)
+
+            # if(lengthtis_wells )
+            tis_index <- which(tis_wells %in% rownames(dist))
+            ref_index <- which(ref_wells %in% colnames(dist))
+
+            dist_tib <- dist[tis_index, ref_index] |>
+              as_tibble(rownames = "tiss") |>
+              pivot_longer(
+                cols = -tiss,
+                names_to = "ref",
+                values_to = "distance"
+              ) |>
+              filter(distance > 0)
+
+            dist_tib
+          }
+        )
+    }
+  )
+
+dist_aggregate <- imap(
+  .x = dist_list,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        y |>
+          group_by(ref) |>
+          summarise(
+            mean = mean(distance),
+            min = min(distance)
+          ) |>
+          mutate(
+            sample = i,
+            type = j
+          )
+      }
+    ) |>
+      bind_rows()
+  }
+)
+
+dist_aggregate_dat <- bind_rows(dist_aggregate)
+
+plots[["dist"]] <- dist_aggregate_dat |>
+  mutate(
+    sample = case_when(
+      sample == "Astro" ~ "AC-like",
+      sample == "Oligo" ~ "OPC-like",
+      sample == "Mesenchymal" ~ "MES-like",
+      sample == "Neuronal" ~ "NPC-like",
+      sample == "Unassigned" ~ "Unknown",
+      .default = sample
+    )
+  ) |>
+  arrange(sample) |>
+  mutate(Sample = type, State = sample) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = mean,
+      colour = State,
+      shape = Sample,
+      fill = Sample
+    )
+  ) +
+  geom_violin(adjust = 1, linewidth = 2, colour = "black") +
+  geom_violin(adjust = 1, linewidth = 1.5) +
+  scale_colour_manual(values = params$annotation_colours) +
+  scale_fill_manual(values = params$type_colours) +
+  labs(
+    y = "Average Distance from Tissue (A.U)",
+    colour = "State"
+  ) +
+  guides(fill = guide_legend(override.aes = list(linewidth = 0))) +
+  # ggtitle(i) +
+  theme(
+    axis.ticks = element_line(colour = "black"),
+    axis.title.x = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+  # ggtitle("All Samples - Tumour Cells") +
+  # theme(legend.key.size = unit(0.75, "cm"))
+
+plots$dist + 
+  ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(10, "cm"))
+
+ggsave(
+  filename = here("output/snrnaseq/plots/phase_dist.pdf"),
+  device = cairo_pdf,
+  width = 40,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/phase_dist.pdf"),
+    here("output/snrnaseq/plots/phase_dist.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+patchwork::wrap_plots(
+  plots$phase_pie,
+  plots$dist
+)
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/phase_dist.pdf"),
+  device = cairo_pdf,
+  width = 40,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/phase_dist.pdf"),
+    here("output/snrnaseq/plots/phase_dist.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+plots$volcano_label <- imap(
+  .x = label_de_list,
+  .f = function(x, i) {
+    # big boilerplate energy
+    try({
+    x <- x |>
+      as_tibble(rownames = "gene_id") |>
+      left_join(ensembl)
+
+    up_lfc <- x |>
+      filter(avg_log2FC > log2(1.5)) |>
+      drop_na(gene_name) |>
+      pull(gene_name)
+    down_lfc <- x |>
+      filter(avg_log2FC < -log2(1.5)) |>
+      drop_na(gene_name) |>
+      pull(gene_name)
+    up_sig_label <- x |>
+      filter(p_val_adj < 0.05 & avg_log2FC > log2(1.5)) |>
+      drop_na(gene_name) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+    down_sig_label <- x |>
+      filter(p_val_adj < 0.05 & avg_log2FC < log2(1.5)) |>
+      drop_na(gene_name) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+
+    up_colour <- params$type_colours[{
+      str_split(i, "_")[[1]][[1]]
+    }]
+    down_colour <- params$type_colours[{
+      str_split(i, "_")[[1]][[3]]
+    }]
+    up_name <- str_split(i, "_")[[1]][[1]]
+    down_name <- str_split(i, "_")[[1]][[3]]
+    
+    label <-  str_split(i, "_")[[1]][[2]]
+    label <-  case_when(
+      label == "Astro" ~ "AC-like",
+      label == "Mesenchymal" ~ "MES-like",
+      label == "Neuronal" ~ "NPC-like",
+      label == "Oligo" ~ "OPC-like",
+      label == "Progenitor" ~ "Progenitor",
+      label == "Unassigned" ~ "Unassigned"
+    )
+
+    x <- x |>
+      mutate(
+        sig = case_when(
+          gene_name %in% up_lfc & p_val_adj < 0.05 ~ "up_sig",
+          gene_name %in% down_lfc & p_val_adj < 0.05 ~ "down_sig"
+        )
+      ) |>
+      mutate(
+        colour_point = case_when(
+          sig == "up_sig" ~ up_colour,
+          sig == "down_sig" ~ down_colour,
+          .default = "grey"
+        )
+      ) |>
+      mutate(
+        label_point = case_when(
+          gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+          .default = NA_character_
+        )
+      ) |>
+      drop_na(gene_name)
+
+    title_up <- paste0(
+      "<span style='color:", up_colour, ";'>Up in ", up_name, " &rarr;</span>"
+    )
+    title_down <- paste0(
+      "<span style='color:", down_colour, ";'> &larr; Up in ", down_name, "</span>"
+    )
+
+    library(ggtext)
+    # plot
+    x |>
+      ggplot(
+        aes(
+          x = avg_log2FC,
+          y = -log10(p_val),
+          colour = colour_point,
+          label = label_point,
+          # shape = is_de_fdr_0.05
+        )
+      ) +
+      geom_point(show.legend = FALSE) +
+      scale_colour_identity() +
+      labs(
+        # y = "Bayes Factor",
+        x = expression("log"[2] * "FC")
+      ) +
+      labs(title = label, subtitle = "") +
+      theme(
+        aspect.ratio = 1,
+        panel.background = element_rect(fill = NA, colour = "black"),
+        panel.grid = element_line(colour = "grey90"),
+        plot.title = element_text(hjust = 0, size = 12)
+        # plot.title = ggtext::element_markdown(hjust = 0.5)
+      ) +
+      geom_hline(
+        yintercept = x |> filter(p_val_adj < 0.05) |> pull(p_val) |> max() %>%
+          {
+            -log10(.)
+          },
+        linetype = "dashed"
+      ) +
+      geom_vline(
+        xintercept = c(-log2(1.5), log2(1.5)),
+        linetype = "dashed"
+      ) +
+      coord_fixed(clip = "off") +
+      # ggtitle(
+      #   "Up in T Up in PDN"
+      # ) +
+      annotate(
+        label = title_up,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 1
+      ) +
+      annotate(
+        label = title_down,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = -Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 0
+      ) +
+      # lims(
+      #   x = c(-max_lfc, max_lfc),
+      #   y = c(min_bayes, max_bayes)
+      # ) +
+      ggrepel::geom_label_repel(
+        max.overlaps = 25,
+        force = 2,
+        size = 10 / .pt,
+        fontface = "italic"
+      )
+    })
+  }
+)
+```
+
+```{r}
+a <- imap(
+  .x = label_de_fgsea,
+  .f = function(x, i) {
+    res <- try({x |>
+      as_tibble() |>
+      mutate(State = i) |>
+      filter(NES < 0)
+  })
+    if(any(class(res) == "try-error")) {
+      return(NA)
+    } else {
+      return(res)
+    }
+  }
+)
+a <- a[!is.na(a)]
+a |>   
+  bind_rows() |>
+  arrange(padj) |>
+  filter(padj < 0.05) |>
+  group_by(pathway) |>
+  # filter(n() > 2) |>s
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = reorder(pathway, padj),
+      fill = padj
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c() +
+  coord_equal(expand = FALSE, clip = "off") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  ylab("") +
+  theme(
+    panel.border = element_blank(),
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  )
+  annotate(
+    label = "<span style='color:#BC3D41;'>Up in PDN</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = -Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 0
+  )
+```
+
+```{r}
+a <- imap(
+  .x = label_de_enrich,
+  .f = function(x, i) {
+    res <- try({x$up$KEGG_2013 |>
+      as_tibble() |>
+      mutate(State = i) |>
+      filter(Adjusted.P.value < 0.05)
+  })
+    if(any(class(res) == "try-error")) {
+      return(NA)
+    } else {
+      return(res)
+    }
+  }
+)
+a <- a[!is.na(a)]
+a <- a |>   
+  bind_rows() |> 
+  mutate(adj.p = Adjusted.P.value)
+
+a$State <- str_replace_all(a$State, pattern = "Astro", "AC-like") |> 
+  str_replace_all(pattern = "Mesenchymal", "MES-like") |> 
+  str_replace_all(pattern = "Oligo", "OPC-like") |> 
+  str_replace_all(pattern = "Neuronal", "NPC-like")
+
+plots$kegg_up_pdn <-  a |>   
+    filter(str_detect(State, "PDN")) |> 
+  filter(str_detect(State, "TIS")) |> 
+# arrange(padj) |>
+  # filter( < 0.05) |>
+  # group_by(Term) |>
+
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = reorder(Term, Adjusted.P.value),
+      fill = adj.p
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c() +
+  coord_equal(expand = FALSE, clip = "off") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  ylab("") +
+  theme(
+    panel.border = element_blank(),
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  )
+
+plots$kegg_up_pdo <-  a |>   
+    filter(str_detect(State, "PDO")) |> 
+  filter(str_detect(State, "TIS")) |> 
+# arrange(padj) |>
+  # filter( < 0.05) |>
+  # group_by(Term) |>
+
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = reorder(Term, Adjusted.P.value),
+      fill = adj.p
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c() +
+  coord_equal(expand = FALSE, clip = "off") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  ylab("") +
+  theme(
+    panel.border = element_blank(),
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  )
+
+patchwork::wrap_plots(
+  plots$kegg_up_pdn,
+  plots$kegg_up_pdo
+)
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/state_kegg.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/state_kegg.pdf"),
+    here("output/snrnaseq/plots/state_kegg.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r fgsea_ac}
+a <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_DNA_REPAIR,
+  stats = label_de_list$PDN_Astro_PDO_Astro |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_name, rank) |>
+    arrange(rank) |>
+    drop_na() |>
+    deframe()
+)
+dat <- bind_rows(
+  bind_rows(
+    a$ticks |> as_tibble() |> mutate(sample = "a"),
+  ) |> mutate(type = "ticks"),
+  bind_rows(
+    a$stats |> as_tibble() |> mutate(sample = "a"),
+  ) |> mutate(type = "stats")
+)
+min_enrich <- min(a$curve$ES)
+
+plots$ac_dna <- dat %>%
+  ggplot() +
+  geom_line(
+    data = a$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = params$type_colours["PDN"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "a"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.05,
+      colour = sample
+    ),
+    size = 0.2,
+    color = params$type_colours["PDN"]
+  )+ 
+geom_hline(yintercept = min_enrich) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "<span style='font-size:10pt'>HALLMARK_DNA_REPAIR</span>\n",
+      "<br>",
+      "<span style='color:#93AA00; font-size:10pt'>PDN vs. PDO, NES =", 
+      label_de_fgsea$PDN_Astro_PDO_Astro |> filter(pathway == "HALLMARK_DNA_REPAIR") |> pull(NES) |> format(digits=3), 
+      ", adj.p = ", 
+       label_de_fgsea$PDN_Astro_PDO_Astro |> filter(pathway == "HALLMARK_DNA_REPAIR") |> pull(padj) |> format(digits=2), 
+      "</span>\n",
+      sep = ""
+    )
+  ) +
+  theme(
+    # aspect.ratio = 1 / 2,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+z <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = label_de_list$PDN_Astro_PDO_Astro |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(ensembl) |>
+    mutate(rank = -log10(p_val) * sign(avg_log2FC)) |>
+    select(gene_name, rank) |>
+    arrange(rank) |>
+    drop_na() |>
+    deframe()
+)
+datz <- bind_rows(
+  bind_rows(
+    z$ticks |> as_tibble() |> mutate(sample = "a"),
+  ) |> mutate(type = "ticks"),
+  bind_rows(
+    z$stats |> as_tibble() |> mutate(sample = "a"),
+  ) |> mutate(type = "stats")
+)
+min_enrich <- min(z$curve$ES)
+
+plots$ac_g2m <- datz %>%
+  ggplot() +
+  geom_line(
+    data = z$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = params$type_colours["PDN"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "a"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.05,
+      colour = sample
+    ),
+    size = 0.2,
+    color = params$type_colours["PDN"]
+  )+ 
+geom_hline(yintercept = min_enrich) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "<span style='font-size:10pt'>HALLMARK_G2M_CHECKPOINT</span>\n",
+      "<br>",
+      "<span style='color:#93AA00; font-size:10pt'>PDN vs. PDO, NES =", 
+      label_de_fgsea$PDN_Astro_PDO_Astro |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(NES) |> format(digits=3), 
+      ", adj.p = ", 
+       label_de_fgsea$PDN_Astro_PDO_Astro |> filter(pathway == "HALLMARK_G2M_CHECKPOINT") |> pull(padj) |> format(digits=2), 
+      "</span>\n",
+      sep = ""
+    )
+  ) +
+  theme(
+    # aspect.ratio = 1 / 2,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+patchwork::wrap_plots(
+  plots$ac_dna,
+  plots$ac_g2m,
+  axes = "collect",
+  ncol = 1
+)
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/ac_gsea.pdf"),
+  device = cairo_pdf,
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/ac_gsea.pdf"),
+    here("output/snrnaseq/plots/ac_gsea.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+patchwork::wrap_plots(
+  plots$malignant_bar, 
+  plots$umap_128
+)
+
+patchwork::wrap_plots(
+  plots$malignant_bar + theme(legend.justification = "left"),
+  plots$umap_128 + labs(title = "GL0128")
+)
+
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/128_new.pdf"),
+  width = 25,
+  height = 12.5,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/128_new.pdf"),
+    here("output/snrnaseq/plots/128_new.pdf")
+  ),
+  stdout = NULL
+)
+library(patchwork)
+patchwork::wrap_plots(
+  plots$mde_all + labs(x = "MDE_1", y = "MDE_2"), 
+  plots$mde_class + labs(x = "MDE_1", y = "MDE_2"),
+  axis_titles = "collect"
+)
+a <- (plots$mde_all + labs(x = "MDE_1", y = "MDE_2") + theme(aspect.ratio = NULL) | plots$mde_class + labs(x = "MDE_1", y = "MDE_2")+ theme(aspect.ratio = NULL) ) + 
+  plot_layout(axis_titles = "collect")
+b <- (plots$mde_mbp + labs(x = "MDE_1", y = "MDE_2") + theme(aspect.ratio = NULL)) / (plots$mde_ptprc + labs(x = "MDE_1", y = "MDE_2")+ theme(aspect.ratio = NULL) ) + 
+  plot_layout(axis_titles = "collect")
+
+a
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/mde_new.pdf"),
+  width = 10*8/3,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mde_new.pdf"),
+    here("output/snrnaseq/plots/mde_new.pdf")
+  ),
+  stdout = NULL
+)
+b
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/mde_expr.pdf"),
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mde_expr.pdf"),
+    here("output/snrnaseq/plots/mde_expr.pdf")
+  ),
+  stdout = NULL
+)
+
+
+
+
+patchwork::wrap_plots(
+  plots$mde_all + labs(x = "MDE_1", y = "MDE_2"), 
+  plots$mde_class + labs(x = "MDE_1", y = "MDE_2"),
+  nrow = 1,
+  axis_titles = "collect",
+  patchwork::wrap_plots(
+    plots$mde_mbp,
+    plots$mde_ptprc,
+    ncol = 1
+  )
+)
+```
+
+```{r}
+plots$broad_volcano$PDN_TIS + plots$broad_volcano$PDO_TIS + plots$rrho
+EnvironmentModules::module_load("texlive")
+ggsave(
+  filename = here("output/snrnaseq/plots/volc_broad_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/volc_broad_new.pdf"),
+    here("output/snrnaseq/plots/volc_broad_new.pdf")
+  ),
+  stdout = NULL
+)
+
+wrap_plots(
+  plots$pdn_up_broad,
+  plots$mki67_vln
+)
+ggsave(
+  filename = here("output/snrnaseq/plots/vln_new.pdf"),
+  device = cairo_pdf,
+  width = 25,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/vln_new.pdf"),
+    here("output/snrnaseq/plots/vln_new.pdf")
+  ),
+  stdout = NULL
+)
+
+wrap_plots(
+  plots$gsea_both_g2m + theme(aspect.ratio = 1/2), 
+  plots$phase_pie
+)
+ggsave(
+  filename = here("output/snrnaseq/plots/pie_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/pie_new.pdf"),
+    here("output/snrnaseq/plots/pie_new.pdf")
+  ),
+  stdout = NULL
+)
+
+wrap_plots(
+  nrow = 1,
+  gsea_six,
+  plots$volcano_label$PDN_Astro_PDO_Astro,
+  # wrap_plots(
+    plots$ac_g2m,
+    # plots$ac_dna,
+    # ncol = 1,
+    axes = "keep"
+  # )
+)
+
+plots$volcano_label$PDN_Astro_PDO_Astro
+ggsave(
+  filename = here("output/snrnaseq/plots/ac_vol_new.pdf"),
+  device = cairo_pdf,
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/ac_vol_new.pdf"),
+    here("output/snrnaseq/plots/ac_vol_new.pdf")
+  ),
+  stdout = NULL
+)
+gsea_six
+ggsave(
+  filename = here("output/snrnaseq/plots/tmz_g2m.pdf"),
+  device = cairo_pdf,
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/tmz_g2m.pdf"),
+    here("output/snrnaseq/plots/tmz_g2m.pdf")
+  ),
+  stdout = NULL
+)
+plots$ac_g2m
+ggsave(
+  filename = here("output/snrnaseq/plots/ac_g2m.pdf"),
+  device = cairo_pdf,
+  width = 10,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/ac_g2m.pdf"),
+    here("output/snrnaseq/plots/ac_g2m.pdf")
+  ),
+  stdout = NULL
+)
+
+wrap_plots(
+  plots$clone_bar,
+  plots$mde_tumour,
+  plots$state_bar + theme(aspect.ratio = NULL),
+  plots$ridge_state
+)
+ggsave(
+  filename = here("output/snrnaseq/plots/new_states.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+```
+
+```{r}
+plots$broad_volcano$PDN_TIS + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/volc_pdn_tis.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/volc_pdn_tis.pdf"),
+    here("output/snrnaseq/plots/volc_pdn_tis.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$broad_volcano$PDO_TIS + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/volc_pdo_tis.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/volc_pdo_tis.pdf"),
+    here("output/snrnaseq/plots/volc_pdo_tis.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$rrho + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/rrho_new_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/rrho_new_new.pdf"),
+    here("output/snrnaseq/plots/rrho_new_new.pdf")
+  ),
+  stdout = NULL
+)
+plots$pdn_up_broad + 
+  ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(5, "cm")) + 
+  theme(axis.title.y = element_blank())
+ggsave(
+  filename = here("output/snrnaseq/plots/pdn_up_broad.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/pdn_up_broad.pdf"),
+    here("output/snrnaseq/plots/pdn_up_broad.pdf")
+  ),
+  stdout = NULL
+)
+plots$mki67_vln + 
+theme(text = element_text(size = 10)) + 
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  theme(
+    axis.text.x = element_text(size = 10), 
+    axis.text.y = element_text(size = 10), 
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.justification = "center"
+    ) +
+  ggh4x::force_panelsizes(rows = unit(3, "cm"), cols = unit(4, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/mki67_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mki67_new.pdf"),
+    here("output/snrnaseq/plots/mki67_new.pdf")
+  ),
+  stdout = NULL
+)
+plots$gsea_both_g2m + 
+  ggh4x::force_panelsizes(rows = unit(3, "cm"), cols = unit(7, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/gsea_both_g2m.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/gsea_both_g2m.pdf"),
+    here("output/snrnaseq/plots/gsea_both_g2m.pdf")
+  ),
+  stdout = NULL
+)
+plots$phase_pie + 
+  guides(fill = guide_legend(title = "", override.aes = list(colour = "black", size = 1))) + 
+  theme(
+    strip.text.x = element_text(angle = 45, vjust = 0.5),
+        strip.clip = "off",
+        text = element_text(size = 10),
+        legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.justification = "center") + 
+  ggh4x::force_panelsizes(rows = unit(1, "cm"), cols = unit(1, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/phase_pie.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/phase_pie.pdf"),
+    here("output/snrnaseq/plots/phase_pie.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$clone_bar + 
+  theme(
+    legend.box = "horizontal",
+    legend.position = "top", 
+    legend.direction = "horizontal", 
+    legend.justification = "center",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.5, "cm"),
+    rect = element_rect(fill = "transparent")
+    # axis.title.x = element_blank()
+  ) + 
+  ggh4x::force_panelsizes(rows = unit(5.25/2, "cm"), cols = unit(5.25/3, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/clone_new_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/clone_new_new.pdf"),
+    here("output/snrnaseq/plots/clone_new_new.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$state_bar + 
+  theme(
+    legend.box = "horizontal",
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    legend.justification = "center",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.5, "cm"),
+    rect = element_rect(fill = "transparent")
+  ) + 
+  ggh4x::force_panelsizes(rows = unit(5.25/2, "cm"), cols = unit(5.25/3, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/state_new_new.pdf"),
+  device = cairo_pdf,
+  
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/state_new_new.pdf"),
+    here("output/snrnaseq/plots/state_new_new.pdf")
+  ),
+  stdout = NULL
+)
+
+ggsave(
+  filename = here("output/snrnaseq/plots/bar_new_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/bar_new_new.pdf"),
+    here("output/snrnaseq/plots/bar_new_new.pdf")
+  ),
+  stdout = NULL
+)
+plots$mde_tumour + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/mde_tum_new.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/mde_tum_new.pdf"),
+    here("output/snrnaseq/plots/mde_tum_new.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$ridge_state + 
+  theme(
+    axis.title.y = element_blank(),
+    legend.key.spacing.y = unit(0.1, "cm"),
+    legend.key.width = unit(0.5, "cm"),
+    legend.key.height = unit(0.5, "cm"),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  ) + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25/2, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_ridge.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_ridge.pdf"),
+    here("output/snrnaseq/plots/new_ridge.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+plots$malignant_bar + 
+  theme(
+    legend.position = "right",
+    legend.key.spacing.y = unit(0.1, "cm"),
+    legend.title = element_blank(),
+    legend.box.spacing = unit(0.1, "cm")
+  ) + 
+   ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25/3, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_class_bar.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_class_bar.pdf"),
+    here("output/snrnaseq/plots/new_class_bar.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$umap_128 + 
+  theme(
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.5, "cm"),
+    legend.key.spacing.y = unit(0.1, "cm"),
+    text = element_text(size = 10),
+    plot.title = element_text(size = 10),
+    legend.box.spacing = unit(0.1, "cm")
+  ) + 
+  ggtitle("GL0128") + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+
+ggsave(
+  filename = here("output/snrnaseq/plots/new_umap_128.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_umap_128.pdf"),
+    here("output/snrnaseq/plots/new_umap_128.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$mde_mbp + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_mbp.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_mbp.pdf"),
+    here("output/snrnaseq/plots/new_mde_mbp.pdf")
+  ),
+  stdout = NULL
+)
+plots$mde_ptprc + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_ptprc.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_ptprc.pdf"),
+    here("output/snrnaseq/plots/new_mde_ptprc.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$alluvial + 
+  theme(text = element_text(size = 10)) + 
+  ggh4x::force_panelsizes(rows = unit(7.5, "cm"), cols = unit(18, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_allu.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_allu.pdf"),
+    here("output/snrnaseq/plots/new_allu.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+
+plots$gsea_both_g2m + 
+  ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(7.5, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/gsea_talk.pdf.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/gsea_talk.pdf.pdf"),
+    here("output/snrnaseq/plots/gsea_talk.pdf.pdf")
+  ),
+  stdout = NULL
+)
+
+plots$state_bar + 
+  theme(legend.position = "none") + 
+  ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(5/3, "cm"))
+
+ggsave(
+  filename = here("output/snrnaseq/plots/state_talk.pdf.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/state_talk.pdf.pdf"),
+    here("output/snrnaseq/plots/state_talk.pdf.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r}
+plots$mde_all + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_all.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_all.pdf"),
+    here("output/snrnaseq/plots/new_mde_all.pdf")
+  ),
+  stdout = NULL
+)
+plots$mde_class + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_class.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_class.pdf"),
+    here("output/snrnaseq/plots/new_mde_class.pdf")
+  ),
+  stdout = NULL
+)
+plots$mde_line + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_line.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_line.pdf"),
+    here("output/snrnaseq/plots/new_mde_line.pdf")
+  ),
+  stdout = NULL
+)
+plots$mde_type + 
+  ggh4x::force_panelsizes(rows = unit(5.25, "cm"), cols = unit(5.25, "cm"))
+ggsave(
+  filename = here("output/snrnaseq/plots/new_mde_type.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 20,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snrnaseq/plots/new_mde_type.pdf"),
+    here("output/snrnaseq/plots/new_mde_type.pdf")
+  ),
+  stdout = NULL
+)
+plots$malignant_bar + 
+  theme(legend.position = "right")
+```
+
+```{r}
+label_de_list$PDN_Astro_TIS_Astro |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDO_Astro_TIS_Astro |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDN_Mesenchymal_TIS_Mesenchymal |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDO_Mesenchymal_TIS_Mesenchymal |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDN_Neuronal_TIS_Neuronal |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDO_Neuronal_TIS_Neuronal |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDN_Progenitor_TIS_Progenitor |> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+label_de_list$PDO_Progenitor_TIS_Progenitor|> 
+  filter(p_val_adj < 0.05) |> 
+  nrow()
+```

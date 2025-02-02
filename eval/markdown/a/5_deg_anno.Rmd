@@ -1,0 +1,1385 @@
+---
+title: "5_deg_anno"
+author: "zm"
+date: "2024-07-22"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+```
+
+```{r sce}
+sce_all <- read_rds(
+  file = here("data", "processed", "4_2_labelled", "sce_all_labels.rds")
+)
+sce_all$line <- str_sub(sce_all$sample, end = 6)
+sce_all$type <- str_sub(sce_all$sample, start = 8)
+
+sce_tumour <- zellkonverter::readH5AD(
+  file = here("data", "processed", "2_5_tumour_only", "sce_tumour.h5ad")
+)
+```
+
+```{r add_labels}
+colData(sce_tumour) <- colData(sce_tumour) |>
+  as_tibble() |>
+  left_join(
+    y = sce_all |>
+      colData() |>
+      as_tibble() |>
+      select(bc_wells, pred_single_labels)
+  ) |>
+  DataFrame()
+```
+
+```{r qc}
+model_gene <- scran::modelGeneVar(
+  x = sce_tumour,
+  block = sce_tumour$sample,
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+chosen_hvgs <- model_gene$bio > 0
+
+plot_model <- imap(
+  .x = model_gene$per.block,
+  .f = function(x, i) {
+    meta <- metadata(x)
+    plot_dat <- as_tibble(x)
+
+    plot_dat |>
+      ggplot(
+        mapping = aes(
+          x = mean,
+          y = total
+        )
+      ) +
+      geom_function(
+        fun = function(x_val) {
+          meta$trend(x_val)
+        },
+        colour = "dodgerblue"
+      ) +
+      geom_point() +
+      ggtitle(i)
+  }
+) |>
+  patchwork::wrap_plots(ncol = 3)
+
+table(chosen_hvgs)
+sce_filt <- sce_tumour
+# sce_filt <- sce_all[chosen_hvgs, ]
+sce_filt <- sce_filt[, !sce_filt$line == "GL0128"]
+```
+
+```{r deg}
+# fix factors
+sce_filt$line <- sce_filt$line |>
+  as.character() |>
+  as.factor()
+
+sce_summed_raw <- scuttle::aggregateAcrossCells(
+  x = sce_filt,
+  ids = DataFrame(
+    type = sce_filt$type,
+    line = sce_filt$line,
+    labels = sce_filt$pred_single_labels
+  )
+)
+
+de_per_anno <- unique(sce_summed_raw$labels) |>
+  set_names() |>
+  map(
+    .progress = TRUE,
+    .f = function(x) {
+      sce_summed <- sce_summed_raw[, sce_summed_raw$labels == x]
+
+      keep <- edgeR::filterByExpr(y = sce_summed, group = sce_summed$type)
+      sce_summed <- sce_summed[keep, ]
+
+      sce_summed <- edgeR::calcNormFactors(object = sce_summed)
+
+      colnames(sce_summed) <- paste(
+        sce_summed$samples$line,
+        sce_summed$samples$type
+      )
+
+      #   plot_mds <- limma::plotMDS(
+      #     x = edgeR::cpm(sce_summed, log = TRUE)
+      # )
+      #   plot_md <- edgeR::plotMD.DGEList(sce_summed) +
+      #     title(x)
+      design <- model.matrix(~ 0 + type + line, sce_summed$samples)
+      design
+
+      sce_summed <- edgeR::estimateDisp(y = sce_summed, design = design)
+
+      # edgeR::plotBCV(y = sce_summed)
+
+      fit <- edgeR::glmQLFit(y = sce_summed, design = design, robust = TRUE)
+
+      map(
+        .x = list(
+          pdn_tis = c(1, 0, -1, 0, 0),
+          pdo_tis = c(0, 1, -1, 0, 0),
+          pdn_pdo = c(1, -1, 0, 0, 0)
+        ),
+        .f = function(y) {
+          edgeR::glmQLFTest(fit, contrast = y)
+        }
+      )
+    }
+  )
+
+plot_per_anno <- imap(
+  .x = de_per_anno,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        dat <- edgeR::topTags(y, n = Inf)$table |>
+          as_tibble()
+
+        dat <- dat |>
+          mutate(rank = -log10(PValue) * logFC)
+
+        # big boilerplate energy
+        up_lfc <- dat |>
+          filter(logFC > 2) |>
+          pull(gene_name)
+        down_lfc <- dat |>
+          filter(logFC < -2) |>
+          pull(gene_name)
+
+        dat <- dat |>
+          mutate(
+            sig = case_when(
+              gene_name %in% up_lfc & FDR < 0.05 ~ "up_sig",
+              gene_name %in% down_lfc & FDR < 0.05 ~ "down_sig"
+            )
+          ) |>
+          mutate(
+            colour_point = case_when(
+              sig == "up_sig" ~ "#BC3D41",
+              sig == "down_sig" ~ "#4F7EBB",
+              .default = "grey"
+            )
+          )
+        dat <- dat |>
+          mutate(
+            sig_shape =
+              case_when(
+                FDR < 0.05 ~ "sig",
+                .default = "not_sig"
+              )
+          )
+
+        up_sig_label <- dat |>
+          arrange(-rank) |>
+          filter(FDR < 0.05) |>
+          filter(logFC > 2) |>
+          slice_head(n = 5) |>
+          pull(gene_name)
+        down_sig_label <- dat |>
+          arrange(rank) |>
+          filter(FDR < 0.05) |>
+          filter(logFC < -2) |>
+          slice_head(n = 5) |>
+          pull(gene_name)
+
+        dat <- dat |>
+          mutate(
+            label_point = case_when(
+              gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+              .default = NA_character_
+            )
+          )
+
+        if (j == "pdn_tis" | j == "pdn_pdo") {
+          title_up <- "<span style='color:#BC3D41;'> Up in PDN &rarr;</span>"
+        } else if (j == "pdo_tis") {
+          title_up <- "<span style='color:#BC3D41;'> Up in PDO &rarr;</span>"
+        }
+
+        if (j == "pdn_tis" | j == "pdo_tis") {
+          title_down <- "<span style='color:#4F7EBB;;'> &larr; Up in TIS </span>"
+        } else if (j == "pdn_pdo") {
+          title_down <- "<span style='color:#4F7EBB;;'> &larr; Up in PDO </span>"
+        }
+
+        library(ggtext)
+
+        dat |>
+          ggplot(
+            aes(
+              x = logFC,
+              y = -log10(FDR),
+              colour = colour_point,
+              label = label_point,
+              shape = sig_shape
+            )
+          ) +
+          geom_point(show.legend = FALSE) +
+          # scale_x_continuous(limits = c(-x_lim, x_lim)) +
+          scale_colour_identity() +
+          labs(
+            y = expression("-log"[10] * "adj.p"),
+            x = expression("log"[2] * "FC")
+          ) +
+          ggtitle(paste0(i, "\n")) +
+          theme(
+            aspect.ratio = 1,
+            panel.background = element_rect(fill = NA, colour = "black"),
+            panel.grid = element_line(colour = "grey90"),
+            plot.title = element_text(size = 11),
+            plot.subtitle = element_text(size = 11)
+          ) +
+          geom_hline(
+            yintercept = -log10(0.05),
+            linetype = "dashed"
+          ) +
+          geom_vline(
+            xintercept = c(-2, 2),
+            linetype = "dashed"
+          ) +
+          coord_fixed(clip = "off") +
+          annotate(
+            label = title_up,
+            geom = "richtext",
+            colour = "white",
+            # label.padding = unit(c(0, 0, 0, 0), "lines"),
+            x = Inf,
+            y = Inf,
+            vjust = -0.1,
+            hjust = 1
+          ) +
+          annotate(
+            label = title_down,
+            geom = "richtext",
+            colour = "white",
+            # label.padding = unit(c(0, 0, 0, 0), "lines"),
+            x = -Inf,
+            y = Inf,
+            vjust = -0.1,
+            hjust = 0
+          ) +
+          ggrepel::geom_label_repel(
+            max.overlaps = 25,
+            force = 2,
+            size = 10 / .pt,
+            fontface = "italic"
+          )
+      }
+    )
+  }
+)
+
+
+de_goana <- map(
+  .progress = TRUE,
+  .x = de_per_anno,
+  .f = function(x) {
+    map(
+      .x = x,
+      .f = function(y) {
+        library(org.Hs.eg.db)
+        hs <- org.Hs.eg.db
+        names <- y$genes$gene_name |> as.character()
+        entrez <- AnnotationDbi::select(hs,
+          keys = names,
+          columns = c("ENTREZID", "SYMBOL"),
+          keytype = "SYMBOL"
+        ) |>
+          distinct()
+        y$genes <- y$genes |>
+          left_join(entrez |> rename(gene_name = SYMBOL))
+
+        edgeR::goana.DGELRT(de = y, geneid = "ENTREZID")
+      }
+    )
+  }
+)
+de_kegg <- map(
+  .progress = TRUE,
+  .x = de_per_anno,
+  .f = function(x) {
+    map(
+      .x = x,
+      .f = function(y) {
+        library(org.Hs.eg.db)
+        hs <- org.Hs.eg.db
+        names <- y$genes$gene_name |> as.character()
+        entrez <- AnnotationDbi::select(hs,
+          keys = names,
+          columns = c("ENTREZID", "SYMBOL"),
+          keytype = "SYMBOL"
+        ) |>
+          distinct()
+        y$genes <- y$genes |>
+          left_join(entrez |> rename(gene_name = SYMBOL))
+
+        edgeR::kegga.DGELRT(de = y, geneid = "ENTREZID")
+      }
+    )
+  }
+)
+
+imap(
+  .progress = TRUE,
+  .x = de_per_anno,
+  .f = function(x, i) {
+    map(
+      .x = x,
+      .f = function(y) {
+        sce_summed <- sce_summed_raw[, sce_summed_raw$labels == i]
+
+        keep <- edgeR::filterByExpr(y = sce_summed, group = sce_summed$type)
+        sce_summed <- sce_summed[keep, ]
+
+        sce_summed <- edgeR::calcNormFactors(object = sce_summed)
+
+        colnames(sce_summed) <- paste(
+          sce_summed$samples$line,
+          sce_summed$samples$type
+        )
+
+        design <- model.matrix(~ 0 + type + line, sce_summed$samples)
+        design
+
+        sce_summed <- edgeR::estimateDisp(y = sce_summed, design = design)
+
+        # edgeR::plotBCV(y = sce_summed)
+
+        fit <- edgeR::glmQLFit(y = sce_summed, design = design, robust = TRUE)
+
+        library(org.Hs.eg.db)
+        hs <- org.Hs.eg.db
+        names <- y$genes$gene_name |> as.character()
+        entrez <- AnnotationDbi::select(hs,
+          keys = names,
+          columns = c("ENTREZID", "SYMBOL"),
+          keytype = "SYMBOL"
+        ) |>
+          distinct()
+        y$genes <- y$genes |>
+          left_join(entrez |> rename(gene_name = SYMBOL))
+
+        z <- edgeR::topTags(y, n = Inf)
+        # edgeR::fry.DGEList(de = y, index =  geneid = "ENTREZID")
+      }
+    )
+  }
+)
+
+hep <- imap(
+  .x = de_goana,
+  .f = function(x, i) {
+    x$pdn_tis |>
+      as_tibble() |>
+      # filter(str_detect(Term, "heparin")) |>
+      mutate(State = i)
+  }
+) |>
+  bind_rows() |>
+  filter(P.Up < 0.05) |>
+  group_by(Term) |>
+  filter(n() > 2) |>
+  ungroup() |>
+  arrange(P.Up) %>%
+  mutate(Term = factor(Term, levels = .$Term |> unique())) |>
+  complete(Term, State) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = Term,
+      fill = P.Up
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c(na.value = "white") +
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 45)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  guides(fill = guide_colorbar(title = "adj.p")) +
+  labs(y = "GO Term") +
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_markdown()
+  ) +
+  ggtitle("<span style='color:#BC3D41;'> Up in PDN</span>")
+ggsave(
+  filename = here("btrg", "hep.pdf"),
+  device = cairo_pdf,
+  width = 15,
+  height = 15,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("btrg", "hep.pdf"),
+    here("btrg", "hep.pdf")
+  ),
+  stdout = NULL
+)
+
+kegg <- imap(
+  .x = de_kegg,
+  .f = function(x, i) {
+    x$pdn_pdo |>
+      as_tibble() |>
+      # filter(str_detect(Term, "heparin")) |>
+      mutate(State = i)
+  }
+) |>
+  bind_rows() |>
+  filter(P.Up < 0.05) |>
+  group_by(Pathway) |>
+  filter(n() > 1) |>
+  ungroup() |>
+  # filter(State %in% c("Neuronal", "Progenitor")) |> 
+  arrange(P.Up) %>%
+  mutate(Pathway = factor(Pathway, levels = .$Pathway |> unique())) |>
+  # slice_head(n = 20) |> 
+  complete(Pathway, State) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = Pathway,
+      fill = P.Up
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c() +
+  scale_x_discrete(expand = c(0, 0), guide = guide_axis(angle = 45)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  guides(fill = guide_colorbar(title = "adj.p")) +
+  labs(y = "KEGG Pathway") +
+  theme(
+    # aspect.ratio = 1,
+    plot.title = element_markdown()
+  ) +
+  ggtitle("<span style='color:#BC3D41;'> Up in PDN</span>")
+
+kegg
+patchwork::wrap_plots(kegg, hep, guides = "collect")
+
+ggsave(
+  filename = here("btrg", "kegghep.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 15,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("btrg", "kegghep.pdf"),
+    here("btrg", "kegghep.pdf")
+  ),
+  stdout = NULL
+)
+
+de_goana$Astro$pdn_tis |>
+  filter(P.Up < 0.05) |>
+  mutate(ratio = Up / N) |>
+  arrange(-P.Up) |>
+  ggplot(
+    mapping = aes(
+      x = ratio,
+      y = fct_inorder(Term),
+      colour = P.Up,
+      size = Up
+    )
+  ) +
+  geom_point()
+
+de_goana$Astro$pdo_tis |>
+  filter(P.Up < 0.05) |>
+  mutate(ratio = Up / N) |>
+  arrange(-P.Up) |>
+  ggplot(
+    mapping = aes(
+      x = ratio,
+      y = fct_inorder(Term),
+      colour = P.Up,
+      size = Up
+    )
+  ) +
+  geom_point()
+```
+
+```{r}
+de_venn_anno <- imap(
+  .x = de_per_anno,
+  .f = function(x, i) {
+    # per sample
+    a <- imap(
+      .x = x,
+      .f = function(y, j) {
+        # per anno
+        edgeR::topTags(y, n = Inf)$table |>
+          as_tibble() |>
+          # filter(logFC > 0) |>
+          filter(FDR < 0.05) |>
+          pull(gene_id)
+      }
+    )
+
+    source("/vast/scratch/users/moore.z/pdo_pdn_comparison/eval/scripts/r/ggeulerr.R")
+    list(
+      PDN = a$pdn_tis,
+      PDO = a$pdo_tis
+    ) |>
+      ggeulerr() +
+      theme(
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        plot.title = element_text(size = 11),
+        plot.subtitle = element_text(size = 11),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank()
+      ) +
+      ggtitle(i) +
+      scale_fill_manual(values = pie_cols) +
+      coord_fixed(clip = "off")
+    # library(ggVennDiagram)
+    # ggVennDiagram::ggVennDiagram(
+    #   x = list(
+    #     PDN = pdn,
+    #     PDO = pdo
+    #   )
+    # ) +
+    #   scale_fill_viridis_c() +
+    #   ggtitle(names) +
+    #   guides(fill = guide_colorbar(title = "No. DEG Up"))
+  }
+)
+patchwork::wrap_plots(de_venn_anno, nrow = 2, guides = "collect")
+ggsave(
+  filename = here("btrg", "venn.pdf"),
+  device = cairo_pdf,
+  width = 45,
+  height = 15,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("btrg", "venn.pdf"),
+    here("btrg", "venn.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r dist_overall}
+dist <- read_csv(
+  file = here("data", "processed", "2_5_tumour_only", "all_dist.csv")
+)
+# conn <- read_csv(
+#   file = here("data", "processed", "2_5_tumour_only", "all_con.csv")
+)
+colnames(dist) <- c("bc_wells", sce_tumour$bc_wells)
+dist <- dist |> select(-1)
+dist <- as.matrix(dist)
+rownames(dist) <- colnames(dist)
+
+col_data <- colData(sce_tumour) |>
+  as_tibble() |> 
+  left_join(singler_anno |> rename(pred_single_labels = labels))
+
+dist_list <- col_data$pred_single_labels |>
+  unique() |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      filt_col_data <- col_data |>
+        filter(pred_single_labels == x)
+
+      c("PDN", "PDO", "T") |>
+        set_names() |>
+        map(
+          .f = function(y) {
+            tis_wells <- filt_col_data |>
+              filter(type == "T") |>
+              pull(bc_wells)
+            ref_wells <- filt_col_data |>
+              filter(type == y) |>
+              pull(bc_wells)
+
+            # if(lengthtis_wells )
+
+            dist_tib <- dist[tis_wells, ref_wells] |>
+              as_tibble(rownames = "tiss") |>
+              pivot_longer(
+                cols = -tiss,
+                names_to = "ref",
+                values_to = "distance"
+              ) |>
+              filter(distance > 0)
+
+            dist_tib
+          }
+        )
+    }
+  )
+
+dist_aggregate <- imap(
+  .x = dist_list,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        y |>
+          group_by(ref) |>
+          summarise(
+            mean = mean(distance),
+            min = min(distance)
+          ) |>
+          mutate(
+            sample = i,
+            type = j
+          )
+      }
+    ) |>
+      bind_rows()
+  }
+)
+
+dist_aggregate_dat <- bind_rows(dist_aggregate)
+#
+#     plot_cols <- sample_cols[str_detect(
+#       string = names(sample_cols),
+#       pattern = paste(
+#         paste($sample, x$type, sep = "_") |>
+#           unique(),
+#         collapse = "|"
+#       )
+#     )] |>
+#       set_names(c("PDN", "PDO"))
+
+res <- aov(mean ~ sample * type, data = dist_aggregate_dat)
+summary(res)
+res_tuk <- TukeyHSD(res)
+
+a <- rownames(res_tuk$`sample:type`)
+b <- str_split(string = a, pattern = "-") |>
+  map(
+    .f = function(x) {
+      str_split(string = x, pattern = ":") |>
+        map(1)
+    }
+  )
+
+comparison_index <- map_vec(
+  .x = b,
+  .f = function(y) {
+    identical(y[[1]], y[[2]])
+  }
+)
+
+
+stat_tib <- res_tuk$`sample:type` |>
+  as_tibble(rownames = "comparison")
+stat_tib <- stat_tib[comparison_index, ] |>
+  mutate(State = str_extract(comparison, pattern = "[^:]*")) |>
+  mutate(sig = case_when(`p adj` < 0.05 ~ TRUE)) |>
+  mutate(adj_p = scales::scientific(`p adj`, digits = 2))
+
+stat_tib$a <- str_split(stat_tib$comparison, pattern = "-") |>
+  map(str_split, pattern = ":") |>
+  map(2) |>
+  map_chr(2)
+stat_tib$b <- str_split(stat_tib$comparison, pattern = "-") |>
+  map(str_split, pattern = ":") |>
+  map(1) |>
+  map_chr(2)
+
+stat_tib <- stat_tib |>
+  mutate(
+    y_val = map_vec(
+      .x = stat_tib$State,
+      .f = function(y) {
+        dist_aggregate_dat |>
+          filter(sample == y) |>
+          pull(mean) |>
+          max()
+      }
+    )
+  ) |>
+  mutate(y_val = y_val * 1.05)
+
+# stat_tib |>
+#      mutate(
+#     State = case_when(
+#       State == "Astro" ~ "AC-like",
+#       State == "Oligo" ~ "OPC-like",
+#       State == "Mesenchymal" ~ "MES-like",
+#       State == "Neuronal" ~ "NPC-like",
+#       State == "Unassigned" ~ "Unknown",
+#       .default = State
+#     )
+#    )
+
+
+highest <- dist_aggregate_dat |>
+  filter(mean == max(mean))
+if (highest$sample %in% {
+  stat_tib |>
+    filter(sig == TRUE) |>
+    pull(State)
+}) {
+  ymax <- max(dist_aggregate_dat$mean) * 1.1
+} else {
+  ymax <- max(dist_aggregate_dat$mean)
+}
+
+dist_plot <- dist_aggregate_dat |>
+  mutate(
+    sample = case_when(
+      sample == "Astro" ~ "AC-like",
+      sample == "Oligo" ~ "OPC-like",
+      sample == "Mesenchymal" ~ "MES-like",
+      sample == "Neuronal" ~ "NPC-like",
+      sample == "Unassigned" ~ "Unknown",
+      .default = sample
+    )
+  ) |>
+  mutate(Sample = type, State = sample) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = mean,
+      colour = State,
+      shape = Sample,
+      fill = Sample
+    )
+  ) +
+  geom_violin(adjust = 1, linewidth = 2, colour = "black") +
+  geom_violin(adjust = 1, linewidth = 1.5) +
+  scale_colour_manual(values = annotation_colours) +
+  scale_fill_manual(values = pie_cols) +
+  labs(
+    y = "Average Distance from Tissue (A.U)",
+    colour = "State"
+  ) +
+  geom_errorbar(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDN", b == "T") |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      ymin = y_val * 1.15,
+      ymax = y_val * 1.15
+    ),
+    width = 2 / 3,
+    linewidth = 0.5
+    # position = position_nudge(x = 1/6)
+  ) +
+  geom_text(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDN", b == "T") |>
+      mutate(label = paste("adj.p =", adj_p)) |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      y = y_val * 1.15,
+      label = label
+    ),
+    size = 8 / .pt,
+    vjust = -1,
+    nudge_x = 0
+  ) +
+  geom_errorbar(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDO", b == "T") |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      ymin = y_val * 1.1,
+      ymax = y_val * 1.1
+    ),
+    width = 1 / 3,
+    linewidth = 0.5,
+    position = position_nudge(x = 1 / 6)
+  ) +
+  geom_text(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDO", b == "T") |>
+      mutate(label = paste("adj.p =", adj_p)) |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      y = y_val * 1.1,
+      label = label
+    ),
+    size = 8 / .pt,
+    vjust = -1,
+    nudge_x = 1 / 6
+  ) +
+  geom_errorbar(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDN", b == "PDO") |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      ymin = y_val * 1.05,
+      ymax = y_val * 1.05
+    ),
+    width = 1 / 3,
+    linewidth = 0.5,
+    position = position_nudge(x = -1 / 6)
+  ) +
+  geom_text(
+    inherit.aes = FALSE,
+    data = stat_tib |>
+      filter(sig == TRUE, a == "PDN", b == "PDO") |>
+      mutate(label = paste("adj.p =", adj_p)) |>
+      mutate(
+        State = case_when(
+          State == "Astro" ~ "AC-like",
+          State == "Oligo" ~ "OPC-like",
+          State == "Mesenchymal" ~ "MES-like",
+          State == "Neuronal" ~ "NPC-like",
+          State == "Unassigned" ~ "Unknown",
+          .default = State
+        )
+      ),
+    mapping = aes(
+      x = State,
+      y = y_val * 1.05,
+      label = label
+    ),
+    size = 8 / .pt,
+    vjust = -0.5,
+    nudge_x = -1 / 6
+  ) +
+  guides(fill = guide_legend(override.aes = list(linewidth = 0))) +
+  ylim(
+    c(
+      min(dist_aggregate_dat$mean) * 1.1,
+      ymax
+    )
+  ) +
+  # ggtitle(i) +
+  theme(
+    aspect.ratio = 1 / 2,
+    axis.ticks = element_line(colour = "black"),
+    axis.title.x = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  ) +
+  ggtitle("All Samples - Tumour Cells") +
+  theme(legend.key.size = unit(0.75, "cm"))
+dist_plot
+ggsave(
+  filename = here("btrg", "dist_examp.pdf"),
+  device = cairo_pdf,
+  width = 22.5,
+  height = 50,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("btrg", "dist_examp.pdf"),
+    here("btrg", "dist_examp.pdf")
+  ),
+  stdout = NULL
+)
+```
+
+```{r cyclone}
+cycle_pairs <- read_rds(
+  file = system.file("exdata", "human_cycle_markers.rds", package = "scran")
+)
+
+cyclone_scores <- scran::cyclone(
+  x = counts(sce_tumour),
+  pairs = cycle_pairs,
+  BPPARAM = MulticoreParam(
+    workers = length(parallelly::availableWorkers())
+  )
+)
+
+scater::plotReducedDim(
+  object = sce_tumour,
+  dimred = "X_scVI_MDE",
+  colour_by = "pred_single_labels"
+)
+
+sce_tumour$score_g1 <- cyclone_scores$normalized.scores$G1
+sce_tumour$score_g2m <- cyclone_scores$normalized.scores$G2M
+sce_tumour$score_s <- cyclone_scores$normalized.scores$S
+
+colData(sce_tumour) |>
+  as_tibble() |>
+  left_join(y = singler_anno |> rename(pred_single_labels = labels)) |> 
+  select(type, pred_single_labels, score_g1, score_g2m, score_s) |>
+  mutate(type = case_when(type == "T" ~ "TIS", .default = type)) |>
+  mutate(
+    pred_single_labels = case_when(
+      pred_single_labels == "Astro" ~ "AC-like",
+      pred_single_labels == "Oligo" ~ "OPC-like",
+      pred_single_labels == "Mesenchymal" ~ "MES-like",
+      pred_single_labels == "Neuronal" ~ "NPC-like",
+      pred_single_labels == "Unassigned" ~ "Unknown",
+      .default = pred_single_labels
+    )
+  ) |>
+  group_by(type, pred_single_labels) |>
+  summarise(G1 = mean(score_g1), G2M = mean(score_g2m), S = mean(score_s)) |>
+  pivot_longer(
+    cols = c(G1, G2M, S),
+    names_to = "phase",
+    values_to = "value"
+  ) |>
+  mutate(labels = paste(round(value, digits = 2) * 100, "%")) |>
+  ggplot(
+    mapping =
+      aes(x = "", y = value, fill = phase)
+  ) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  facet_grid(
+    rows = vars(type),
+    cols = vars(pred_single_labels),
+    switch = "y"
+  ) +
+  geom_text(
+    aes(label = labels),
+    position = position_stack(vjust = 0.5),
+    show.legend = FALSE
+  ) +
+  guides(fill = guide_legend(title = "Phase")) +
+  # facet_wrap(~ellipse) +
+  theme(
+    aspect.ratio = 1,
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.spacing.x = unit(0, "lines"),
+    panel.spacing.y = unit(0, "lines"),
+    panel.background = element_rect(fill = "white", colour = NA),
+    strip.text.y.left = element_text(angle = 0),
+    strip.background = element_rect(fill = "white", colour = NA),
+  )
+
+ggsave(
+  filename = here("btrg", "pie_cell_cycle.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 15,
+  units = "cm"
+)
+```
+
+```{r ora}
+msigdb_hallmark <- msigdbr::msigdbr(
+  category = "H"
+)
+msigdb_c2 <- msigdbr::msigdbr(
+  category = "C2"
+)
+
+msigdb_hallmark_list <- unique(msigdb_hallmark$gs_name) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      msigdb_hallmark |>
+        filter(gs_name == x) |>
+        pull(gene_symbol)
+    }
+  )
+msigdb_c2_list <- unique(msigdb_c2$gs_name) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      msigdb_c2 |>
+        filter(gs_name == x) |>
+        pull(gene_symbol)
+    }
+  )
+
+hallmark_msigdb_res <- imap(
+  .progress = TRUE,
+  .x = de_per_anno,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        dat <- edgeR::topTags(y, n = Inf)$table |>
+          as_tibble()
+
+        fgsea::fgsea(
+          pathways = msigdb_hallmark_list,
+          stats = dat |>
+            mutate(rank = -log10(PValue) * sign(logFC)) |>
+            select(gene_name, rank) |>
+            deframe()
+        )
+      }
+    )
+  }
+)
+c2_msigdb_res <- imap(
+  .progress = TRUE,
+  .x = de_per_anno,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        dat <- edgeR::topTags(y, n = Inf)$table |>
+          as_tibble()
+
+        fgsea::fgsea(
+          pathways = msigdb_c2_list,
+          stats = dat |>
+            mutate(rank = -log10(PValue) * sign(logFC)) |>
+            select(gene_name, rank) |>
+            deframe()
+        )
+      }
+    )
+  }
+)
+
+kegg_volc <- c2_msigdb_res$Astro$pdn_pdo |>
+  as_tibble() |>
+  filter(str_detect(pathway, "KEGG_")) |>
+  mutate(sig = case_when(padj < 0.05 & NES > 0 ~ "up_sig", padj < 0.05 & NES < 0 ~ "down_sig")) |>
+  mutate(label = case_when(
+    pathway %in% c(
+      "KEGG_RIBOSOME",
+      "KEGG_SPLICEOSOME",
+      # "KEGG_CELL_CYCLE",
+      "KEGG_OXIDATIVE_PHOSPHORYLATION",
+      # "KEGG_STEROID_BIOSYNTHESIS",
+      "KEGG_PROTEASOME",
+      "KEGG_GLYCOLYSIS_GLUCONEOGENESIS"
+    ) ~ pathway
+  )) |>
+  mutate(
+    colour_point = case_when(
+      sig == "up_sig" ~ "#BC3D41",
+      sig == "down_sig" ~ "#4F7EBB",
+      .default = "grey"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = NES,
+      y = -log10(padj),
+      colour = colour_point
+    )
+  ) +
+  geom_point() +
+  scale_colour_identity() +
+  ggrepel::geom_label_repel(
+    mapping = aes(
+      label = label
+    ),
+    size = 10 / .pt
+  ) +
+  labs(
+    y = expression("-log"[10] * "adj.p"),
+    x = expression("Normalised Enrichment Score")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_line(colour = "grey90"),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  ) +
+  annotate(
+    label = "<span style='color:#BC3D41;'> Up in PDN &rarr;</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 1
+  ) +
+  annotate(
+    label = "<span style='color:#4F7EBB;'> &larr; Up in PDO</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = -Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 0
+  ) +
+  coord_fixed(clip = "off")
+
+a <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_MTORC1_SIGNALING,
+  stats = edgeR::topTags(de_per_anno$Astro$pdn_tis, n = Inf)$table |>
+    as_tibble() |>
+    mutate(rank = -log10(PValue) * sign(logFC)) |>
+    select(gene_name, rank) |>
+    deframe()
+)
+b <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = edgeR::topTags(de_per_anno$Astro$pdo_tis, n = Inf)$table |>
+    as_tibble() |>
+    mutate(rank = -log10(PValue) * sign(logFC)) |>
+    select(gene_name, rank) |>
+    deframe()
+)
+c <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_MTORC1_SIGNALING,
+  stats = edgeR::topTags(de_per_anno$Progenitor$pdn_pdo, n = Inf)$table |>
+    as_tibble() |>
+    mutate(rank = -log10(PValue) * sign(logFC)) |>
+    select(gene_name, rank) |>
+    deframe()
+)
+
+dat <- bind_rows(
+  bind_rows(
+    a$ticks |> as_tibble() |> mutate(sample = "a"),
+    b$ticks |> as_tibble() |> mutate(sample = "b")
+  ) |> mutate(type = "ticks"),
+  bind_rows(
+    a$stats |> as_tibble() |> mutate(sample = "b"),
+    b$stats |> as_tibble() |> mutate(sample = "b")
+  ) |> mutate(type = "stats")
+)
+
+min_enrich <- min(a$curve$ES, b$curve$ES)
+
+gsea_comp <- dat %>%
+  ggplot() +
+  geom_line(
+    data = a$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = pie_cols["PDN"],
+  ) +
+  geom_line(
+    data = b$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = pie_cols["PDO"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "a"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.05,
+      colour = sample
+    ),
+    size = 0.2,
+    color = pie_cols["PDN"]
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "b"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich - 0.05,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.1,
+      colour = sample
+    ),
+    size = 0.2,
+    color = pie_cols["PDO"]
+  ) +
+  geom_hline(yintercept = min_enrich) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "<span style='font-size:12pt'>Progenitor</span>",
+      "<span style='font-size:12pt'>HALLMARK_G2M_CHECKPOINT</span>\n",
+      "<span style='color:#F8766D; font-size:10pt'>PDN vs. TIS: NES = 1.58, adj.p = 8.93e-4</span>\n",
+      "<span style='color:#00BA38; font-size:10pt'>PDO vs. TIS: NES = 1.23, adj.p = 0.30</span>\n",
+      sep = "<br>"
+    )
+  ) +
+  theme(
+    aspect.ratio = 1 / 2,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  ) +
+  ggh4x::force_panelsizes(
+    rows = unit(5, "cm"),
+    cols = unit(10, "cm")
+  )
+gsea_comp
+max_enrich <- max(a$curve$ES)
+min_enrich_2 <- min(c$curve$ES)
+
+gsea_comp_2 <- ggplot() +
+  geom_line(
+    data = c$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = "black",
+  ) +
+  geom_segment(
+    data = c$ticks,
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich_2,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich_2 - 0.1
+    ),
+    size = 0.2,
+  ) +
+  geom_hline(yintercept = min_enrich_2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  expand_limits(y = max_enrich) +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "Progenitor",
+      "HALLMARK_G2M_CHECKPOINT\n",
+      "PDN vs. PDO: NES = 1.34, adj.p = 0.038",
+      sep = "<br>"
+    )
+  ) +
+  theme(
+    aspect.ratio = 1,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+patchwork::wrap_plots(
+  gsea_comp, gsea_comp_2
+)
+
+ggsave(
+  filename = here("btrg", "nes.pdf"),
+  device = cairo_pdf,
+  width = 30,
+  height = 15,
+  units = "cm"
+)
+```
+
+```{r}
+patchwork::wrap_plots(
+  plot_per_anno$Astro$pdn_tis + ggtitle("AC-like\n") + ggh4x::force_panelsizes(cols = unit(7.5, "cm"), rows = unit(7.5, "cm")),
+  plot_per_anno$Astro$pdo_tis + ggtitle("AC-like\n") + ggh4x::force_panelsizes(cols = unit(7.5, "cm"), rows = unit(7.5, "cm"))
+)
+```
+
+ mutate(
+    pred_single_labels = case_when(
+      pred_single_labels == "Astro" ~ "AC-like",
+      pred_single_labels == "Oligo" ~ "OPC-like",
+      pred_single_labels == "Mesenchymal" ~ "MES-like",
+      pred_single_labels == "Neuronal" ~ "NPC-like",
+      pred_single_labels == "Unassigned" ~ "Unknown",
+      .default = pred_single_labels
+    )

@@ -1,0 +1,248 @@
+---
+title: "snp"
+author: "zm"
+date: "2024-09-02"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+plots <- list()
+```
+
+```{r snp}
+sample_uids <- list(
+  GL0028 = list(
+    "TIS" = "207686170123_R01C02",
+    "PDO" = "207686170123_R12C01",
+    "PDN" = "208115890066_R10C02"
+  ),
+  GL0038 = list(
+    "TIS" = "207686170123_R02C01",
+    "PDO" = "207686170123_R11C01",
+    "PDN" = "208146560163_R11C02"
+  ),
+  GL0095 = list(
+    "TIS" = "208115890028_R02C01",
+    "PDO" = "208115890066_R04C01",
+    "PDN" = "208115890028_R11C01"
+  ),
+  GL0128 = list(
+    "TIS" = "208579500154_R03C01",
+    "PDO" = "208115890066_R06C01",
+    "PDN" = "208115890066_R12C02"
+  )
+)
+source("/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/snp_process/scripts/list_dir_n_depth.R")
+segment_paths <- list_dir_n_depth(
+  path_use = "/stornext/Bioinf/data/lab_brain_cancer/data_processed/SNP/plots/",
+  depth_keep = 2
+) |>
+  list.files(
+    pattern = "segments",
+    full.names = TRUE
+  )
+
+segment_paths_filt <-
+  str_detect(
+    segment_paths,
+    pattern = unlist(sample_uids) |>
+      paste(collapse = "|")
+  ) %>%
+  segment_paths[.]
+
+segment_files <- map(
+  .x = segment_paths_filt,
+  .f = read_csv,
+  show_col_type = FALSE
+)
+
+names(segment_files) <- imap(
+  .x = sample_uids,
+  .f = function(x, i) {
+    paste(i, names(x), sep = "_")
+  }
+) |>
+  unlist(use.names = FALSE)
+
+segment_files <- imap(
+  .x = segment_files,
+  .f = function(x, i) {
+    x |>
+      mutate(sample = i) |>
+      mutate(
+        line = str_split(sample, pattern = "_") |> map(1) |> unlist(),
+        type = str_split(sample, pattern = "_") |> map(2) |> unlist()
+      )
+  }
+)
+
+dat <- bind_rows(
+  segment_files
+)
+
+dat <- dat |>
+  group_by(sample, chr) |>
+  mutate(diff = lead(startpos) - endpos) |>
+  ungroup()
+
+index_diff <- dat$diff > 1e5
+index_diff <- which(x = index_diff)
+
+dat <- map(
+  .x = index_diff,
+  .f = function(x) {
+    dat[x, ] |>
+      mutate(
+        startpos = endpos + 1,
+        endpos = dat[x + 1, ]$startpos - 1
+      )
+  }
+) |>
+  bind_rows(dat)
+
+ramp_loss_func <- scales::colour_ramp(c("blue", "white"))
+ramp_gain_func <- scales::colour_ramp(c("white", "red"))
+# add 1 to include white
+ramp_loss <- ramp_loss_func(x = seq(0, 1, length = 3)) |>
+  head(-1)
+ramp_gain <- ramp_gain_func(x = seq(0, 1, length = 9)) |>
+  tail(-1)
+
+plot_snp <- map(
+  .x = dat$line |> unique() |> sort(),
+  .f = function(x) {
+    dat |>
+      filter(line == x) |>
+      mutate(total = nMajor + nMinor) |>
+      mutate(
+        total = case_when(
+          total > 10 ~ "> 10",
+          .default = as.character(total)
+        ),
+      ) |>
+      ggplot(
+        mapping = aes(
+          xmin = startpos,
+          xmax = endpos,
+          ymin = 0,
+          ymax = 1,
+          fill = total
+        )
+      ) +
+      geom_rect(show.legend = TRUE) +
+      scale_fill_manual(
+        values = c(ramp_loss, "#ffffff", ramp_gain) |>
+          set_names(nm = c(0:9) |> as.character(), "> 10"),
+        breaks = c(c(0:9) |> as.character(), "> 10"),
+        drop = FALSE
+      ) +
+      scale_x_continuous(expand = c(0, 0)) +
+      scale_y_continuous(expand = c(0, 0)) +
+      #  ggh4x::facet_nested_wrap(
+      #    facets = vars(type, chr),
+      #    dir = "h",
+      #    strip.position = "left",
+      #    axes = "all",
+      #    remove_labels = "all"
+      # ) +
+      # theme(strip.placement = "outside")
+      facet_grid(
+        rows = vars(sample),
+        cols = vars(chr),
+        scales = "free",
+        switch = "y"
+      ) +
+      theme(
+        aspect.ratio = 1,
+        panel.spacing.x = unit(0, "lines"),
+        panel.spacing.y = unit(0, "lines"),
+        axis.text.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_text(angle = 0),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+        strip.text.y.left = element_text(angle = 0)
+      )
+  }
+)
+
+plot_snp[[1]] + theme(legend.position = "none", strip.background = element_rect(fill = NA)) +
+  ggh4x::force_panelsizes(rows = unit(0.5, "cm"), cols = unit(0.5, "cm")) +
+  theme(
+    strip.text.y = element_text(colour = "white"),
+    strip.background.y = element_rect(fill = line_cols[1])
+  )
+
+patchwork::wrap_plots(
+  plot_snp[[1]] +
+    theme(legend.position = "none", strip.background = element_rect(fill = NA)) +
+    ggh4x::force_panelsizes(rows = unit(0.5, "cm"), cols = unit(0.5, "cm")) +
+    theme(strip.text.y = element_text(colour = "white"), strip.background.y = element_rect(fill = line_cols[1])),
+  plot_snp[[2]] + 
+    theme(legend.position = "none", strip.text.x.top = element_blank(), strip.background = element_rect(fill = NA)) + 
+    ggh4x::force_panelsizes(rows = unit(0.5, "cm"), cols = unit(0.5, "cm")) +
+    theme(strip.text.y = element_text(colour = "white"), strip.background.y = element_rect(fill = line_cols[2])),
+  plot_snp[[3]] + theme(strip.text.x.top = element_blank(), strip.background = element_rect(fill = NA)) + guides(fill = guide_legend(title = "Abs. CN")) + 
+    ggh4x::force_panelsizes(rows = unit(0.5, "cm"), cols = unit(0.5, "cm")) +
+    theme(strip.text.y = element_text(colour = "white"), strip.background.y = element_rect(fill = line_cols[3])),
+  plot_snp[[4]] + theme(legend.position = "none", strip.text.x.top = element_blank(), strip.background = element_rect(fill = NA)) + 
+    ggh4x::force_panelsizes(rows = unit(0.5, "cm"), cols = unit(0.5, "cm")) +
+    theme(strip.text.y = element_text(colour = "white"), strip.background.y = element_rect(fill = line_cols[4])) +
+    theme(legend.key.height = unit(0.5, "cm"), legend.key.width = unit(0.5, "cm")),
+  ncol = 1,
+  guides = "collect"
+)
+
+ggsave(
+  filename = here("output/snp/plots/overview.pdf"),
+  device = cairo_pdf,
+  width = 17.5,
+  height = 10,
+  units = "cm"
+)
+
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snp/plots/overview.pdf"),
+    here("output/snp/plots/overview.pdf")
+  ),
+  stdout = NULL
+)
+
+ggsave(
+  plot_growth,
+  filename = here("output/snp/plots/growth.pdf"),
+  device = cairo_pdf,
+  width = 17.5,
+  height = 10,
+  units = "cm"
+)
+system2(
+  command = "pdfcrop",
+  args = c(
+    here("output/snp/plots/growth.pdf"),
+    here("output/snp/plots/growth.pdf")
+  ),
+  stdout = NULL
+)
+```
