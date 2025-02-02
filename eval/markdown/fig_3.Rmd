@@ -1,0 +1,1117 @@
+---
+title: "figure_3"
+author: "zm"
+date: "2024-10-17"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+plots <- list()
+```
+
+```{r six_t}
+sce_treated_vehicle_anno <- read_rds(
+  "/stornext/Bioinf/data/lab_brain_cancer/projects/optimisations/single_cell/parse_fixed_pilot/data/process/sce_treated_vehicle_anno.rds"
+)
+
+six_t_data <- reducedDim(
+  sce_treated_vehicle_anno, "UMAP"
+) |>
+  as_tibble() |>
+  rename(UMAP_1 = 1, UMAP_2 = 2) |>
+  cbind(
+    colData(sce_treated_vehicle_anno) |>
+      as_tibble()
+  ) |>
+  as_tibble()
+
+plots[["umap_six_t"]] <- six_t_data %>%
+  mutate(Treatment = case_when(
+    sample == "cell_treated" ~ "TMZ", sample == "cell_vehicle" ~ "Vehicle"
+  )) |>
+  mutate(State = annotation) |>
+  mutate(State = case_when(State == "Death" ~ "Unassigned", State == "Unknown" ~ "Unassigned",
+    .default = State
+  )) |>
+  mutate(Treatment = factor(Treatment, levels = c("Vehicle", "TMZ"))) |>
+  ggplot(
+    mapping = aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      colour = State,
+      fill = State,
+      shape = Treatment
+    )
+  ) +
+  geom_point(
+    size = 1,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = annotation_colours) +
+  scale_fill_manual(values = annotation_colours) +
+  scale_shape_manual(values = c(15, 17) |> set_names("Vehicle", "TMZ")) +
+  # scale_shape_manual(values = type_shapes) +
+  guides(
+    # colour = guide_legend(title = "State", order = 1),
+    # fill = guide_legend(title = "State", order = 1),
+    colour = FALSE,
+    fill = FALSE,
+    shape = guide_legend(title = "Treatment", override.aes = list(size = 3))
+  ) +
+  theme(
+    text = element_text(size = 10),
+    aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+# ggh4x::force_panelsizes(
+#   rows = unit(7.5, "cm"),
+#   cols = unit(7.5, "cm")
+# )
+
+library(ggtext)
+
+plots[["bar_six_t"]] <- six_t_data |>
+  group_by(sample) |>
+  mutate(annotation = case_when(annotation == "Death" ~ "Unassigned", annotation == "Unknown" ~ "Unassigned",
+    .default = annotation
+  )) |>
+  dplyr::count(annotation) |>
+  mutate(Proportion = n / sum(n)) |>
+  ungroup() |>
+  group_by(annotation) |>
+  mutate(change = Proportion[1] - Proportion[2]) |>
+  select(annotation, change) |>
+  distinct() |>
+  arrange(change) |>
+  ggplot(
+    aes(y = fct_reorder(annotation, change), x = change, fill = annotation)
+  ) +
+  geom_col(colour = "black", linewidth = 0.25) +
+  scale_fill_manual(values = annotation_colours) +
+  scale_y_discrete(limits = rev) +
+  ylab("Proportional Change from Vehicle") +
+  theme(
+    # text = element_text(size = 10),
+    legend.position = "none",
+    axis.title.y = element_blank(),
+    plot.title = element_text(size = 10),
+    # axis.title.y = element_text(size = 10),
+    # axis.title.x = element_text(size = 10),
+    strip.text.x = element_text(size = 10),
+    strip.background = element_rect(colour = "black", fill = NA, linewidth = 0.0),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.25),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  ) +
+  annotate(
+    label = "<span style='color:#BC3D41; font-size:10pt;'> TMZ &rarr;</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 1
+  ) +
+  annotate(
+    label = "<span style='color:#4F7EBB; font-size:10pt;'> &larr; Vehicle </span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = -Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 0
+  ) +
+  coord_fixed(clip = "off") +
+  labs(x = "Proportional Change in States")
+```
+
+```{r anno_deg}
+sce_list <- read_rds(
+  file = here("data/intermed/snrnaseq/2_sce_line_list.rds")
+)
+sce_all <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    # no bueno
+    reducedDim(sce, "PCA") <- NULL
+    reducedDim(sce, "UMAP") <- NULL
+
+    sce
+  }
+) |>
+  purrr::reduce(.f = cbind)
+
+deg_list_anno <- list(
+  de_pdn_t = read_csv(
+    file = here("data/processed/per_anno_pdn_tis.csv"),
+    show_col_types = FALSE
+  ) |>
+    dplyr::rename(gene_id = 1) |>
+    mutate(
+      individual_anno = case_when(
+        individual_anno == "Astro" ~ "AC-like",
+        individual_anno == "Mesenchymal" ~ "MES-like",
+        individual_anno == "Neuronal" ~ "NPC-like",
+        individual_anno == "Oligo" ~ "OPC-like",
+        individual_anno == "Unknown" ~ "Unassigned",
+        .default = individual_anno
+      )
+    ),
+  de_pdo_t = read_csv(
+    file = here("data/processed/per_anno_pdo_tis.csv"),
+    show_col_types = FALSE
+  ) |>
+    dplyr::rename(gene_id = 1) |>
+    mutate(
+      individual_anno = case_when(
+        individual_anno == "Astro" ~ "AC-like",
+        individual_anno == "Mesenchymal" ~ "MES-like",
+        individual_anno == "Neuronal" ~ "NPC-like",
+        individual_anno == "Oligo" ~ "OPC-like",
+        individual_anno == "Unknown" ~ "Unassigned",
+        .default = individual_anno
+      )
+    ),
+  de_pdn_pdo = read_csv(
+    file = here("data/processed/per_anno_pdn_pdo.csv"),
+    show_col_types = FALSE
+  ) |>
+    dplyr::rename(gene_id = 1) |>
+    mutate(
+      individual_anno = case_when(
+        individual_anno == "Astro" ~ "AC-like",
+        individual_anno == "Mesenchymal" ~ "MES-like",
+        individual_anno == "Neuronal" ~ "NPC-like",
+        individual_anno == "Oligo" ~ "OPC-like",
+        individual_anno == "Unknown" ~ "Unassigned",
+        .default = individual_anno
+      )
+    )
+)
+
+plots[["volcano"]] <- imap(
+  .x = deg_list_anno,
+  .f = function(x, i) {
+    # per sample
+
+    plots <- imap(
+      .x = x$individual_anno |> unique(),
+      .f = function(y, j) {
+        if (i != "de_pdn_pdo") {
+          max_lfc <- map_dbl(
+            deg_list_anno,
+            .f = function(z) {
+              z |>
+                filter(individual_anno == y) |>
+                pull(lfc_mean) |>
+                max()
+            }
+          ) |> max()
+          min_lfc <- map_dbl(
+            deg_list_anno,
+            .f = function(z) {
+              z |>
+                filter(individual_anno == y) |>
+                pull(lfc_mean) |>
+                min()
+            }
+          ) |> min()
+          max_bayes <- map_dbl(
+            deg_list_anno,
+            .f = function(z) {
+              z |>
+                filter(individual_anno == y) |>
+                pull(bayes_factor) |>
+                max()
+            }
+          ) |> max()
+
+          min_bayes <- map_dbl(
+            deg_list_anno,
+            .f = function(z) {
+              z |>
+                filter(individual_anno == y) |>
+                pull(bayes_factor) |>
+                min()
+            }
+          ) |> min()
+        } else {
+          max_lfc <- deg_list_anno$de_pdn_pdo |>
+            filter(individual_anno == y) |>
+            pull(lfc_mean) |>
+            max()
+          min_lfc <- deg_list_anno$de_pdn_pdo |>
+            filter(individual_anno == y) |>
+            pull(lfc_mean) |>
+            min()
+          max_bayes <- deg_list_anno$de_pdn_pdo |>
+            filter(individual_anno == y) |>
+            pull(bayes_factor) |>
+            max()
+          min_bayes <- deg_list_anno$de_pdn_pdo |>
+            filter(individual_anno == y) |>
+            pull(bayes_factor) |>
+            min()
+        }
+
+        dat <- x |>
+          filter(individual_anno == y)
+
+        dat <- dat |>
+          left_join(
+            y = sce_all |>
+              rowData() |>
+              as_tibble() |>
+              select(gene_id, gene_name)
+          )
+
+        # big boilerplate energy
+        up_lfc <- dat |>
+          filter(lfc_mean > 2) |>
+          pull(gene_name)
+        down_lfc <- dat |>
+          filter(lfc_mean < -2) |>
+          pull(gene_name)
+        up_sig_label <- dat |>
+          mutate(
+            rank = bayes_factor * lfc_mean
+          ) |>
+          arrange(-rank) |>
+          filter(!str_starts(gene_name, "ENSG")) |>
+          filter(is_de_fdr_0.05 == TRUE) |>
+          filter(lfc_mean > 2) |>
+          slice_head(n = 5) |>
+          pull(gene_name)
+        down_sig_label <- dat |>
+          mutate(
+            rank = bayes_factor * lfc_mean
+          ) |>
+          arrange(rank) |>
+          filter(!str_starts(gene_name, "ENSG")) |>
+          filter(is_de_fdr_0.05 == TRUE) |>
+          filter(lfc_mean < -2) |>
+          slice_head(n = 5) |>
+          pull(gene_name)
+
+        dat <- dat |>
+          mutate(
+            sig = case_when(
+              gene_name %in% up_lfc & is_de_fdr_0.05 == TRUE ~ "up_sig",
+              gene_name %in% down_lfc & is_de_fdr_0.05 == TRUE ~ "down_sig"
+            )
+          ) |>
+          mutate(
+            colour_point = case_when(
+              sig == "up_sig" ~ "#BC3D41",
+              sig == "down_sig" ~ "#4F7EBB",
+              .default = "grey"
+            )
+          ) |>
+          mutate(
+            label_point = case_when(
+              gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+              .default = NA_character_
+            )
+          )
+
+        if (i == "de_pdn_t") {
+          title_up <- "<span style='color:#BC3D41;'> Up in PDN &rarr;</span>"
+          title_down <- "<span style='color:#4F7EBB;;'> &larr; Up in TIS </span>"
+        } else if (i == "de_pdo_t") {
+          title_up <- "<span style='color:#BC3D41;'> Up in PDO &rarr;</span>"
+          title_down <- "<span style='color:#4F7EBB;;'> &larr; Up in TIS </span>"
+        } else if (i == "de_pdn_pdo") {
+          title_up <- "<span style='color:#BC3D41;'> Up in PDN &rarr;</span>"
+          title_down <- "<span style='color:#4F7EBB;;'> &larr; Up in PDO </span>"
+        }
+
+        # x_lim <- max(abs(dat$lfc_mean))
+
+        library(ggtext)
+
+        # plot
+        dat |>
+          ggplot(
+            aes(
+              x = lfc_mean,
+              y = bayes_factor,
+              colour = colour_point,
+              label = label_point,
+              shape = is_de_fdr_0.05
+            )
+          ) +
+          geom_point(show.legend = FALSE) +
+          # scale_x_continuous(limits = c(-x_lim, x_lim)) +
+          scale_colour_identity() +
+          labs(
+            y = "Bayes Factor",
+            x = expression("log"[2] * "FC")
+          ) +
+          theme(
+            aspect.ratio = 1,
+            panel.background = element_rect(fill = NA, colour = "black"),
+            panel.grid = element_line(colour = "grey90"),
+            plot.title = element_text(size = 11),
+            plot.subtitle = element_text(size = 11)
+          ) +
+          geom_hline(
+            yintercept = dat |> filter(is_de_fdr_0.05 == FALSE) |> dplyr::slice(1) |> pull(bayes_factor),
+            linetype = "dashed"
+          ) +
+          geom_vline(
+            xintercept = c(-2, 2),
+            linetype = "dashed"
+          ) +
+          labs(
+            title = y,
+            subtitle = ""
+          ) +
+          coord_fixed(clip = "off") +
+          xlim(c(min_lfc, max_lfc)) +
+          ylim(c(min_bayes, max_bayes)) +
+          annotate(
+            label = title_up,
+            geom = "richtext",
+            colour = "white",
+            # label.padding = unit(c(0, 0, 0, 0), "lines"),
+            x = Inf,
+            y = Inf,
+            vjust = -0.1,
+            hjust = 1
+          ) +
+          annotate(
+            label = title_down,
+            geom = "richtext",
+            colour = "white",
+            # label.padding = unit(c(0, 0, 0, 0), "lines"),
+            x = -Inf,
+            y = Inf,
+            vjust = -0.1,
+            hjust = 0
+          ) +
+          ggrepel::geom_label_repel(
+            max.overlaps = 25,
+            force = 2,
+            size = 10 / .pt,
+            fontface = "italic"
+          )
+        # patchwork::plot_annotation(
+        #   title = title,
+        #   theme = theme(plot.title = ggtext::element_markdown(hjust = 0.25))
+        # )
+      }
+    )
+
+    names(plots) <- x$individual_anno |> unique()
+    plots
+  }
+)
+
+plots[["rrho"]] <- map(
+  .x = deg_list_anno$de_pdn_t$individual_anno |> unique() |> discard(is.na),
+  .f = function(x) {
+    rrho <- RRHO2::RRHO2_initialize(
+      list1 = deg_list_anno$de_pdn_t |>
+        filter(individual_anno == x) |>
+        # mutate(val = bayes_factor) |>
+        mutate(val = -log10(bayes_factor) * (lfc_mean)) |>
+        # filter(group1 == unique(diff$group1)[1]) |>
+        select(gene_id, val) |>
+        mutate(val = jitter(val)) |>
+        distinct(gene_id, .keep_all = TRUE) |>
+        drop_na() |>
+        as.data.frame(),
+      list2 = deg_list_anno$de_pdo_t |>
+        filter(individual_anno == x) |>
+        # mutate(val = bayes_factor) |>
+        mutate(val = -log10(bayes_factor) * (lfc_mean)) |>
+        # filter(group1 == unique(diff$group1)[2]) |>
+        select(gene_id, val) |>
+        mutate(val = jitter(val)) |>
+        distinct(gene_id, .keep_all = TRUE) |>
+        drop_na() |>
+        as.data.frame(),
+      # BY = TRUE,
+      # boundary = 0.1
+      # log10.ind = TRUE,
+      # stepsize = 50,
+      # alternative = "two.sided"
+      # method = "fisher"
+      multipleTesting = "none"
+    )
+
+    rrho_plot <- lattice::levelplot(
+      x = rrho$hypermat,
+      xlab = "pdn vs. tis",
+      ylab = "pdo vs. tis"
+    )
+    hypermat <- rrho$hypermat |>
+      as_tibble()
+
+    hypermat |>
+      rownames_to_column(var = "var1") |>
+      pivot_longer(
+        cols = -var1, names_to = "var2", values_to = "value"
+      ) |>
+      mutate(
+        var1 = factor(var1, levels = 1:ncol(rrho$hypermat)),
+        var2 = factor(gsub("V", "", var2), levels = 1:ncol(rrho$hypermat))
+      ) |>
+      ggplot(
+        mapping =
+          aes(
+            x = var1,
+            y = var2,
+            fill = value
+          )
+      ) +
+      geom_tile() +
+      scale_fill_viridis_c(na.value = "white", limits = c(0, 750)) +
+      labs(
+        x = "<span style='color:#4F7EBB;'>&larr; Up in TIS</span>
+        <span style='color:#BC3D41;'>Up in PDN &rarr;</span>",
+        y = "<span style='color:#4F7EBB;'>&larr; Up in TIS</span>
+        <span style='color:#BC3D41;'>Up in PDO &rarr;</span>",
+        fill = expression("-log"[10] * "p")
+      ) +
+      ggtitle(x) +
+      theme(
+        aspect.ratio = 1,
+        axis.text = element_blank(),
+        axis.title.y = ggtext::element_markdown(vjust = 0.5),
+        axis.title.x = ggtext::element_markdown(hjust = 0.5),
+        axis.ticks = element_blank(),
+        plot.title = element_text(size = 12)
+      )
+  }
+)
+
+names(plots$rrho) <- deg_list_anno$de_pdn_t$individual_anno |>
+  unique() |>
+  discard(is.na)
+
+plots$rrho <- plots$rrho[order(names(plots$rrho))]
+
+plots[["collated_volcano"]] <- map(
+  .x = c("AC-like", "MES-like"),
+  .f = function(x) {
+    patchwork::wrap_plots(
+      plots$volcano$de_pdn_t[[x]],
+      plots$volcano$de_pdo_t[[x]] + ggtitle(label = "")
+    )
+  }
+)
+
+enrich_deg_list_anno <- imap(
+  .x = deg_list_anno,
+  .f = function(x, i) {
+    # per sample
+
+    res <- map(
+      .x = x$individual_anno |> unique(),
+      .f = function(y) {
+        filt <- x |>
+          filter(individual_anno == y) |>
+          filter(lfc_mean > 0) |>
+          filter(is_de_fdr_0.05 == TRUE) |>
+          left_join(
+            rowData(sce_all) |>
+              as_tibble()
+          )
+        library(enrichR)
+        enrichR::enrichr(
+          genes = filt$gene_name |> as.character(),
+          databases = c("GO_Molecular_Function_2018", "KEGG_2021_Human")
+        )
+      }
+    )
+    names(res) <- x$individual_anno |> unique()
+    res
+  }
+)
+
+msigdb_hallmark <- msigdbr::msigdbr(
+  category = "H"
+)
+msigdb_c2 <- msigdbr::msigdbr(
+  category = "C2"
+)
+msigdb_hallmark_list <- unique(msigdb_hallmark$gs_name) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      msigdb_hallmark |>
+        filter(gs_name == x) |>
+        pull(gene_symbol)
+    }
+  )
+msigdb_c2_list <- unique(msigdb_c2$gs_name) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      msigdb_c2 |>
+        filter(gs_name == x) |>
+        pull(gene_symbol)
+    }
+  )
+
+msigdb_hallmark_res <- imap(
+  .progress = TRUE,
+  .x = deg_list_anno,
+  .f = function(x, i) {
+    res <- map(
+      .x = x$individual_anno |> unique(),
+      .f = function(y) {
+        dat <- x |>
+          filter(individual_anno == y) |>
+          left_join(
+            rowData(sce_all) |>
+              as_tibble()
+          )
+
+        fgsea::fgsea(
+          pathways = msigdb_hallmark_list,
+          stats = dat |>
+            mutate(rank = -log10(bayes_factor) * sign(lfc_mean)) |>
+            select(gene_name, rank) |>
+            deframe()
+        )
+      }
+    )
+    names(res) <- x$individual_anno |> unique()
+
+    res
+  }
+)
+msigdb_c2_res <- imap(
+  .progress = TRUE,
+  .x = deg_list_anno,
+  .f = function(x, i) {
+    res <- map(
+      .x = x$individual_anno |> unique(),
+      .f = function(y) {
+        dat <- x |>
+          filter(individual_anno == y) |>
+          left_join(
+            rowData(sce_all) |>
+              as_tibble()
+          )
+
+
+        fgsea::fgsea(
+          pathways = msigdb_c2_list[startsWith(names(msigdb_c2_list), "KEGG_")],
+          stats = dat |>
+            mutate(rank = -log10(bayes_factor) * sign(lfc_mean)) |>
+            select(gene_name, rank) |>
+            deframe()
+        )
+      }
+    )
+    names(res) <- x$individual_anno |> unique()
+
+    res
+  }
+)
+
+plots[["nes_volcano"]] <- msigdb_hallmark_res$de_pdn_pdo$`AC-like` |>
+  as_tibble() |>
+  mutate(NES = NES * -1) |>
+  arrange(padj) |>
+  mutate(rank = 1:n()) |>
+  mutate(sig = case_when(padj < 0.05 & NES > 0 ~ "up_sig", padj < 0.05 & NES < 0 ~ "down_sig")) |>
+  mutate(label = case_when(
+    # pathway %in% c(
+    #   "KEGG_RIBOSOME",
+    #   "KEGG_SPLICEOSOME",
+    #   # "KEGG_CELL_CYCLE",
+    #   "KEGG_OXIDATIVE_PHOSPHORYLATION",
+    #   # "KEGG_STEROID_BIOSYNTHESIS",
+    #   "KEGG_PROTEASOME",
+    #   "KEGG_GLYCOLYSIS_GLUCONEOGENESIS"
+    # ) ~ pathway
+    padj < 0.05 & rank <= 5 ~ pathway
+  )) |>
+  mutate(
+    colour_point = case_when(
+      sig == "up_sig" ~ "#BC3D41",
+      sig == "down_sig" ~ "#4F7EBB",
+      .default = "grey"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = NES,
+      y = -log10(padj),
+      colour = colour_point
+    )
+  ) +
+  geom_point() +
+  scale_colour_identity() +
+  ggrepel::geom_label_repel(
+    mapping = aes(
+      label = label
+    ),
+    size = 8 / .pt,
+    max.overlaps = 100
+  ) +
+  labs(
+    y = expression("-log"[10] * "adj.p"),
+    x = expression("Normalised Enrichment Score")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_line(colour = "grey90"),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  ) +
+  annotate(
+    label = "<span style='color:#BC3D41;'> Up in PDN &rarr;</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 1
+  ) +
+  annotate(
+    label = "<span style='color:#4F7EBB;'> &larr; Up in PDO</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = -Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 0
+  ) +
+  labs(title = "AC-like", subtitle = "") +
+  coord_fixed(clip = "off")
+
+plots[["tile_pdn_pdo"]] <- imap(
+  .x = msigdb_hallmark_res$de_pdn_pdo,
+  .f = function(x, i) {
+    x |>
+      as_tibble() |>
+      mutate(State = i) |>
+      filter(NES < 0)
+  }
+) |>
+  bind_rows() |>
+  arrange(padj) |>
+  filter(padj < 0.05) |>
+  group_by(pathway) |>
+  filter(n() > 2) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = reorder(pathway, padj),
+      fill = padj
+    )
+  ) +
+  geom_tile(colour = "black") +
+  scale_fill_viridis_c() +
+  coord_equal(expand = FALSE, clip = "off") +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  ylab("") +
+  theme(
+    panel.border = element_blank(),
+    panel.background = element_rect(fill = NA, colour = "black"),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 11),
+    plot.subtitle = element_text(size = 11)
+  ) +
+  annotate(
+    label = "<span style='color:#BC3D41;'>Up in PDN</span>",
+    geom = "richtext",
+    colour = "white",
+    # label.padding = unit(c(0, 0, 0, 0), "lines"),
+    x = -Inf,
+    y = Inf,
+    vjust = -0.1,
+    hjust = 0
+  )
+
+a <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = deg_list_anno$de_pdn_t |>
+    filter(individual_anno == "Progenitor") |>
+    as_tibble() |>
+    mutate(rank = (bayes_factor) * (lfc_median)) |>
+    left_join(rowData(sce_all) |> as_tibble()) |>
+    select(gene_name, rank) |>
+    deframe()
+)
+b <- fgsea::plotEnrichmentData(
+  pathway = msigdb_hallmark_list$HALLMARK_G2M_CHECKPOINT,
+  stats = deg_list_anno$de_pdo_t |>
+    filter(individual_anno == "Progenitor") |>
+    as_tibble() |>
+    mutate(rank = (bayes_factor) * (lfc_median)) |>
+    left_join(rowData(sce_all) |> as_tibble()) |>
+    select(gene_name, rank) |>
+    deframe()
+)
+dat <- bind_rows(
+  bind_rows(
+    a$ticks |> as_tibble() |> mutate(sample = "a"),
+    b$ticks |> as_tibble() |> mutate(sample = "b")
+  ) |> mutate(type = "ticks"),
+  bind_rows(
+    a$stats |> as_tibble() |> mutate(sample = "a"),
+    b$stats |> as_tibble() |> mutate(sample = "b")
+  ) |> mutate(type = "stats")
+)
+min_enrich <- min(a$curve$ES, b$curve$ES)
+
+plots[["gsea"]] <- dat %>%
+  ggplot() +
+  geom_line(
+    data = a$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = pie_cols["PDN"],
+  ) +
+  geom_line(
+    data = b$curve,
+    mapping = aes(
+      x = rank,
+      y = ES
+    ),
+    color = pie_cols["PDO"],
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "a"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.05,
+      colour = sample
+    ),
+    size = 0.2,
+    color = pie_cols["PDN"]
+  ) +
+  geom_segment(
+    data = . %>% filter(type == "ticks") %>% filter(sample == "b"),
+    mapping = aes(
+      x = rank,
+      # y = -a$spreadES / 16,
+      y = min_enrich - 0.05,
+      xend = rank,
+      # yend = a$spreadES / 16
+      yend = min_enrich - 0.1,
+      colour = sample
+    ),
+    size = 0.2,
+    color = pie_cols["PDO"]
+  ) +
+  geom_hline(yintercept = min_enrich) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(
+    breaks = c(0, 0.2, 0.4),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Rank") +
+  ggtitle(
+    paste(
+      "<span style='font-size:10pt'>Progenitor</span>",
+      "<span style='font-size:10pt'>HALLMARK_G2M_CHECKPOINT</span>\n",
+      "<span style='color:#93AA00; font-size:10pt'>PDN vs. TIS</span>\n",
+      "<span style='color:#00B9E3; font-size:10pt'>PDO vs. TIS</span>",
+      sep = "<br>"
+    )
+  ) +
+  theme(
+    # aspect.ratio = 1 / 2,
+    plot.title = ggtext::element_markdown(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+sce_fil <- sce_all[, !sce_all$sample %in% c("GL0128_PDN", "GL0128_PDO", "GL0128_T")]
+# cycle_pairs <- read_rds(
+#   file = system.file("exdata", "human_cycle_markers.rds", package = "scran")
+# )
+#
+# cyclone_scores <- scran::cyclone(
+#       x = counts(sce_fil),
+#       pairs = cycle_pairs,
+#       BPPARAM = MulticoreParam(
+#         workers = length(parallelly::availableWorkers())
+#       )
+#     )
+# write_rds(
+#   x = cyclone_scores,
+#   file = here("data/processed/cyclone_scores.rds")
+# )
+cyclone_scores <- read_rds(
+  file = here("data/processed/cyclone_scores.rds")
+)
+sce_fil$score_g1 <- cyclone_scores$normalized.scores$G1
+sce_fil$score_g2m <- cyclone_scores$normalized.scores$G2M
+sce_fil$score_s <- cyclone_scores$normalized.scores$S
+
+sce_scvi <- read_rds(
+  file = here("data/intermed/snrnaseq/7_sce_scvi.rds")
+)
+sce_fil <- sce_fil[, sce_fil$bc_wells %in% sce_scvi$bc_wells]
+
+plots[["phase_pie"]] <- colData(sce_fil) |>
+  as_tibble() |>
+  mutate(
+    line = str_sub(sample, end = 6),
+    type = str_sub(sample, start = 8)
+  ) |>
+  select(type, individual_anno, score_g1, score_g2m, score_s) |>
+  mutate(type = case_when(type == "T" ~ "TIS", .default = type)) |>
+  mutate(
+    individual_anno = case_when(
+      individual_anno == "Astro" ~ "AC-like",
+      individual_anno == "Oligo" ~ "OPC-like",
+      individual_anno == "Mesenchymal" ~ "MES-like",
+      individual_anno == "Neuronal" ~ "NPC-like",
+      individual_anno == "Unassigned" ~ "Unknown",
+      .default = individual_anno
+    )
+  ) |>
+  drop_na() |>
+  group_by(type, individual_anno) |>
+  summarise(G1 = mean(score_g1), G2M = mean(score_g2m), S = mean(score_s)) |>
+  pivot_longer(
+    cols = c(G1, G2M, S),
+    names_to = "phase",
+    values_to = "value"
+  ) |>
+  mutate(labels = paste(round(value, digits = 2) * 100, "%")) |>
+  ggplot(
+    mapping =
+      aes(x = "", y = value, fill = phase)
+  ) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  facet_grid(
+    rows = vars(type),
+    cols = vars(individual_anno),
+    switch = "y"
+  ) +
+  geom_text(
+    aes(label = labels),
+    position = position_stack(vjust = 0.5),
+    show.legend = FALSE
+  ) +
+  guides(fill = guide_legend(title = "Phase")) +
+  # facet_wrap(~ellipse) +
+  theme(
+    aspect.ratio = 1,
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.spacing.x = unit(0, "lines"),
+    panel.spacing.y = unit(0, "lines"),
+    panel.background = element_rect(fill = "white", colour = NA),
+    strip.text.y.left = element_text(angle = 0),
+    strip.background = element_rect(fill = "white", colour = NA),
+  )
+```
+
+```{r dist}
+dist <- vroom::vroom(
+  file = here("data/intermed/snrnaseq/distances.csv")
+)
+
+colnames(dist) <- c("bc_wells", sce_scvi$bc_wells)
+dist <- dist |> select(-1)
+dist <- as.matrix(dist)
+rownames(dist) <- colnames(dist)
+
+col_data <- colData(sce_scvi) |>
+  as_tibble() |>
+  mutate(
+    line = str_sub(sample, end = 6),
+    type = str_sub(sample, start = 8)
+  )
+
+dist_list <- col_data$individual_anno |>
+  unique() |>
+  discard(is.na) |>
+  set_names() |>
+  map(
+    .f = function(x) {
+      filt_col_data <- col_data |>
+        filter(individual_anno == x)
+
+      c("PDN", "PDO", "T") |>
+        set_names() |>
+        map(
+          .f = function(y) {
+            tis_wells <- filt_col_data |>
+              filter(type == "T") |>
+              pull(bc_wells)
+            ref_wells <- filt_col_data |>
+              filter(type == y) |>
+              pull(bc_wells)
+
+            # if(lengthtis_wells )
+            tis_index <- which(tis_wells %in% rownames(dist))
+            ref_index <- which(ref_wells %in% colnames(dist))
+
+            dist_tib <- dist[tis_index, ref_index] |>
+              as_tibble(rownames = "tiss") |>
+              pivot_longer(
+                cols = -tiss,
+                names_to = "ref",
+                values_to = "distance"
+              ) |>
+              filter(distance > 0)
+
+            dist_tib
+          }
+        )
+    }
+  )
+
+dist_aggregate <- imap(
+  .x = dist_list,
+  .f = function(x, i) {
+    imap(
+      .x = x,
+      .f = function(y, j) {
+        y |>
+          group_by(ref) |>
+          summarise(
+            mean = mean(distance),
+            min = min(distance)
+          ) |>
+          mutate(
+            sample = i,
+            type = j
+          )
+      }
+    ) |>
+      bind_rows()
+  }
+)
+
+dist_aggregate_dat <- bind_rows(dist_aggregate)
+
+plots[["dist"]] <- dist_aggregate_dat |>
+  mutate(
+    sample = case_when(
+      sample == "Astro" ~ "AC-like",
+      sample == "Oligo" ~ "OPC-like",
+      sample == "Mesenchymal" ~ "MES-like",
+      sample == "Neuronal" ~ "NPC-like",
+      sample == "Unassigned" ~ "Unknown",
+      .default = sample
+    )
+  ) |>
+  arrange(sample) |>
+  mutate(Sample = type, State = sample) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  ggplot(
+    mapping = aes(
+      x = State,
+      y = mean,
+      colour = State,
+      shape = Sample,
+      fill = Sample
+    )
+  ) +
+  geom_violin(adjust = 1, linewidth = 2, colour = "black") +
+  geom_violin(adjust = 1, linewidth = 1.5) +
+  scale_colour_manual(values = annotation_colours) +
+  scale_fill_manual(values = pie_cols) +
+  labs(
+    y = "Average Distance from Tissue (A.U)",
+    colour = "State"
+  ) +
+  guides(fill = guide_legend(override.aes = list(linewidth = 0))) +
+  # ggtitle(i) +
+  theme(
+    axis.ticks = element_line(colour = "black"),
+    axis.title.x = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  ) +
+  ggtitle("All Samples - Tumour Cells") +
+  theme(legend.key.size = unit(0.75, "cm"))
+```
+
+```{r patchwork}
+plots$rrho_new <- plots$rrho
+
+plots$rrho_new$`AC-like` <- plots$rrho_new$`AC-like` + ggh4x::force_panelsizes(rows = unit(5, "cm"), cols = unit(5, "cm"))
+
+patchwork::wrap_plots(
+  patchwork::wrap_plots(
+    plots$umap_six_t + theme(legend.position = "right") + ggh4x::force_panelsizes(rows = unit(7, "cm"), cols = unit(7, "cm")),
+    plots$bar_six_t + ggh4x::force_panelsizes(rows = unit(7, "cm"), cols = unit(7, "cm")),
+    plots$volcano$de_pdn_pdo$`AC-like`,
+    plots$tile_pdn_pdo,
+    nrow = 1
+  ),
+  patchwork::wrap_plots(
+    plots$phase_pie,
+    plots$gsea + theme(aspect.ratio = 1 / 2)
+  ),
+  patchwork::wrap_plots(
+    patchwork::wrap_plots(
+      plots$rrho_new,
+      ncol = 3,
+      guides = "collect"
+    ),
+    plots$dist,
+    nrow = 1
+  ),
+  ncol = 1
+) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave(
+  filename = here("figure_3.pdf"),
+  device = cairo_pdf,
+  width = 45,
+  height = 45,
+  units = "cm"
+)
+```

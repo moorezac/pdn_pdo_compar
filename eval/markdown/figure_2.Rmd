@@ -1,0 +1,976 @@
+---
+title: "figure_2"
+author: "zm"
+date: "2024-10-18"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+plots <- list()
+```
+
+```{r import}
+sce_list <- read_rds(
+  file = here("data/intermed/snrnaseq/2_sce_line_list.rds")
+)
+sce_all <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    # no bueno
+    reducedDim(sce, "PCA") <- NULL
+    reducedDim(sce, "UMAP") <- NULL
+
+    sce
+  }
+) |>
+  purrr::reduce(.f = cbind)
+
+sce_scvi <- read_rds(
+  file = here("data/intermed/snrnaseq/7_sce_scvi.rds")
+)
+numbat_res <- read_rds(
+  file = here("data/processed/SCRNA_240430_240621/numbat/final_numbat_res.rds")
+)
+sce_scvi$numbat_res <- colData(sce_scvi) |>
+  as_tibble() |>
+  left_join(numbat_res |> rename(bc_wells = bc_wells_corr)) |>
+  pull(numbat_res)
+sce_scvi$p_cnv <- colData(sce_scvi) |>
+  as_tibble() |>
+  left_join(numbat_res |> rename(bc_wells = bc_wells_corr)) |>
+  pull(p_cnv)
+sce_scvi$line <- colData(sce_scvi) |>
+  as_tibble() |>
+  left_join(numbat_res |> rename(bc_wells = bc_wells_corr)) |>
+  pull(line)
+
+sce_scvi$normal_res <-
+  sce_scvi$line == "GL0128" | sce_scvi$numbat_res == "normal" | sce_scvi$leiden %in% c(22, 23, 24)
+
+sce_scvi_filt <- sce_scvi[, !sce_scvi$normal_res]
+
+sce_scvi_filt$Line <- str_sub(sce_scvi_filt$sample, end = 6)
+sce_scvi_filt$Sample <- str_sub(sce_scvi_filt$sample, start = 8)
+sce_scvi_filt$Sample <- case_when(
+  sce_scvi_filt$Sample == "T" ~ "TIS",
+  .default = sce_scvi_filt$Sample
+)
+sce_scvi_filt$State <- sce_scvi_filt$individual_anno
+
+sce_scvi_filt$State <- case_when(
+  sce_scvi_filt$State == "Astro" ~ "AC-like",
+  sce_scvi_filt$State == "Mesenchymal" ~ "MES-like",
+  sce_scvi_filt$State == "Neuronal" ~ "NPC-like",
+  sce_scvi_filt$State == "Oligo" ~ "OPC-like",
+  .default = sce_scvi_filt$State
+)
+
+sce_scvi_tumour <- read_rds(here("data/intermed/snrnaseq/9_tumour_scvi_sce.rds"))
+```
+
+```{r bar_anno}
+plots[["bar_anno"]] <- colData(sce_scvi_filt) |>
+  as_tibble() |>
+  select(Line, Sample, State) |>
+  drop_na() |>
+  ggplot(
+    mapping = aes(
+      x = Sample,
+      # y = type,
+      fill = State
+    )
+  ) +
+  geom_bar(position = "fill", colour = "black", linewidth = 0.25) +
+  # geom_bar(stat = "identity") +
+  facet_grid(~Line) +
+  scale_fill_manual(values = annotation_colours) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  ) +
+  ylab("Freq")
+```
+
+```{r ridge_anno}
+individual_anno_res <- read_rds(
+  "/vast/scratch/users/moore.z/pdo_compar/data/intermed/snrnaseq/2_individual_anno_res.rds"
+)
+
+plots[["ridge_anno"]] <- map2(
+  .x = individual_anno_res$test,
+  .y = individual_anno_res$res,
+  .f = function(x, y) {
+    y |>
+      mutate(sample = x) |>
+      select(-c(labels, delta.next, pruned.labels)) |>
+      pivot_longer(cols = -c(barcode, sample))
+  }
+) |>
+  bind_rows() |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8),
+    name = case_when(
+      name == "scores.Astro" ~ "AC-like",
+      name == "scores.Mesenchymal" ~ "MES-like",
+      name == "scores.Neuronal" ~ "NPC-like",
+      name == "scores.Oligo" ~ "OPC-like",
+      name == "scores.Progenitor" ~ "Progenitor",
+      name == "scores.Unassigned" ~ "Unassigned"
+    )
+  ) |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  filter(Line != "GL0128") |>
+  ggplot(
+    mapping = aes(
+      x = value,
+      y = name,
+      fill = Sample
+    )
+  ) +
+  ggridges::geom_density_ridges2(
+    panel_scaling = FALSE,
+    alpha = 0.5,
+    scale = 0.75,
+    bandwidth = 0.025,
+  ) +
+  facet_wrap(~Line) +
+  scale_y_discrete(expand = c(0.01, 0.01, 0.125, 0.0), limits = rev) +
+  scale_fill_manual(values = pie_cols) +
+  labs(y = "State", x = "Score") +
+  theme(
+    axis.ticks = element_line(colour = "black"),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_line(colour = "grey90"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+```
+
+```{r mde}
+plots[["mde_tumour"]] <- reducedDim(sce_scvi_tumour, "X_scVI_MDE") |>
+  as_tibble() |>
+  mutate(bc_well = sce_scvi_tumour$bc_wells) |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  mutate(
+    State = case_when(
+      individual_anno == "Astro" ~ "AC-like",
+      individual_anno == "Mesenchymal" ~ "MES-like",
+      individual_anno == "Neuronal" ~ "NPC-like",
+      individual_anno == "Oligo" ~ "OPC-like",
+      individual_anno == "Unknown" ~ "Unassigned",
+      .default = individual_anno
+    )
+  ) |>
+  drop_na() |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = State,
+      fill = State,
+      shape = Sample
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = annotation_colours) +
+  scale_fill_manual(values = annotation_colours) +
+  scale_shape_manual(values = type_shapes) +
+  guides(
+    # colour = guide_legend(title = "Sample"),
+    shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    # aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["mde_all"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000081237", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = Line,
+      fill = Line,
+      shape = Sample
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = line_cols) +
+  scale_fill_manual(values = line_cols) +
+  scale_shape_manual(values = type_shapes) +
+  guides(
+    colour = guide_legend(title = "Line"),
+    shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["mde_sample"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000081237", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  slice(sample(1:n())) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = Sample,
+      # fill = Sample,
+      shape = Sample
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  # scale_colour_manual(values = line_cols) +
+  # scale_fill_manual(values = line_cols) +
+  scale_shape_manual(values = type_shapes) +
+  guides(
+    colour = guide_legend(title = "Sample"),
+    shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["mde_normal"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000081237", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    Class = case_when(
+      normal_res == TRUE ~ "Normal",
+      normal_res == FALSE ~ "Tumour"
+    )
+  ) |>
+  slice(sample(1:n())) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = Class,
+      fill = Class,
+      shape = Sample
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  geom_point() +
+  scale_colour_manual(values = c("#77c298", "#e84d60")) +
+  scale_fill_manual(values = c("#77c298", "#e84d60")) +
+  scale_shape_manual(values = type_shapes) +
+  guides(
+    colour = guide_legend(title = "Class"),
+    shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    # aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["mde_ptprc"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000081237", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!Line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    Ellipse = case_when(
+      leiden == 23 & MDE_1 > 2 ~ "Immune",
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = PTPRC,
+      # fill = Line,
+      # shape = Sample,
+      group = Ellipse
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  scale_colour_viridis_c() +
+  ggforce::geom_mark_ellipse(
+    inherit.aes = FALSE,
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      group = Ellipse,
+      # colour = Ellipse,
+      filter = !is.na(Ellipse)
+    ),
+    colour = "black",
+    expand = unit(2, "mm")
+  ) +
+  geom_point() +
+  # scale_colour_manual(values = c("#056517", "#de1a24")) +
+  # scale_fill_manual(values = c("#056517", "#de1a24")) +
+  # scale_shape_manual(values = type_shapes) +
+  guides(
+    colour = guide_colourbar(title = expression(italic("PTPRC"))),
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["mde_mbp"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000197971", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    Ellipse = case_when(
+      leiden == 22 & MDE_1 > 2 ~ "Oligo",
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  ggplot(
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      colour = PTPRC,
+      # fill = Line,
+      # shape = Sample,
+      group = Ellipse
+    )
+  ) +
+  geom_point(
+    size = 2,
+    key_glyph = "rect"
+  ) +
+  scale_colour_viridis_c() +
+  ggforce::geom_mark_ellipse(
+    inherit.aes = FALSE,
+    mapping = aes(
+      x = MDE_1,
+      y = MDE_2,
+      group = Ellipse,
+      # colour = Ellipse,
+      filter = !is.na(Ellipse)
+    ),
+    colour = "black",
+    expand = unit(2, "mm")
+  ) +
+  geom_point() +
+  # scale_colour_manual(values = c("#056517", "#de1a24")) +
+  # scale_fill_manual(values = c("#056517", "#de1a24")) +
+  # scale_shape_manual(values = type_shapes) +
+  guides(
+    colour = guide_colourbar(title = expression(italic("MBP"))),
+    # shape = guide_legend(title = "Sample", override.aes = list(size = 3))
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.ticks = element_line(colour = "black"),
+    axis.text = element_blank(),
+    panel.grid.major = element_line(colour = "grey90"),
+    panel.grid.minor = element_line(colour = "grey90"),
+    panel.background = element_rect(fill = "white", colour = "black")
+  )
+
+plots[["pie_ptpc"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000081237", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    Ellipse = case_when(
+      leiden == 23 & MDE_1 > 2 ~ "Immune",
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  filter(!is.na(Ellipse)) |>
+  group_by(Sample, Ellipse) |>
+  count() |>
+  group_by(Ellipse) |>
+  mutate(Percent = n / sum(n) * 100) |>
+  mutate(labels = paste(round(Percent, digits = 2), "%")) |>
+  ggplot(
+    mapping = aes(
+      x = "",
+      y = Percent,
+      fill = Sample
+    )
+  ) +
+  scale_fill_manual(values = pie_cols) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(
+    aes(label = labels),
+    position = position_stack(vjust = 0.5),
+    show.legend = FALSE
+  ) +
+  # facet_wrap(~ellipse) +
+  theme(
+    aspect.ratio = 1,
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.background = element_rect(fill = "white", colour = NA)
+  )
+
+plots[["pie_mbp"]] <- reducedDim(sce_scvi, "X_scVI_MDE") |>
+  as_tibble(rownames = "bc_well") |>
+  rename(MDE_1 = V1, MDE_2 = V2) |>
+  left_join(colData(sce_scvi) |> as_tibble(rownames = "bc_well")) |>
+  mutate(PTPRC = logcounts(sce_scvi)["ENSG00000197971", ]) |>
+  mutate(
+    Line = str_sub(sample, end = 6),
+    Sample = str_sub(sample, start = 8)
+  ) |>
+  filter(!line == "GL0128") |>
+  mutate(Sample = case_when(Sample == "T" ~ "TIS", .default = Sample)) |>
+  mutate(
+    Ellipse = case_when(
+      leiden == 22 & MDE_1 > 2 ~ "Oligo",
+      # high_oligo == "oligo" ~ "Oligo"
+    )
+  ) |>
+  filter(!is.na(Ellipse)) |>
+  group_by(Sample, Ellipse) |>
+  count() |>
+  group_by(Ellipse) |>
+  mutate(Percent = n / sum(n) * 100) |>
+  mutate(labels = paste(round(Percent, digits = 2), "%")) |>
+  ggplot(
+    mapping = aes(
+      x = "",
+      y = Percent,
+      fill = Sample
+    )
+  ) +
+  scale_fill_manual(values = pie_cols) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(
+    aes(label = labels),
+    position = position_stack(vjust = 0.5),
+    show.legend = FALSE
+  ) +
+  # facet_wrap(~ellipse) +
+  theme(
+    aspect.ratio = 1,
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank(),
+    panel.background = element_rect(fill = "white", colour = NA)
+  )
+```
+
+```{r deg_list_plots}
+deg_list <- list(
+  de_pdn_t = read_csv(
+    file = here("data/processed/broad_pdn_t.csv"),
+    show_col_types = FALSE
+  ),
+  de_pdo_t = read_csv(
+    file = here("data/processed/broad_pdo_t.csv"),
+    show_col_types = FALSE
+  )
+)
+
+deg_list <- map(
+  .x = deg_list,
+  .f = function(x) {
+    x |>
+      rename(gene_id = 1) |>
+      left_join(
+        y = rowData(sce_all) |>
+          as_tibble() |>
+          select(gene_id, gene_name),
+        by = join_by(gene_id)
+      ) |>
+      relocate(gene_name)
+  }
+)
+
+max_lfc <- map_dbl(
+  .x = deg_list,
+  .f = function(x) {
+    max(x$lfc_mean)
+  }
+) |> max()
+max_bayes <- map_dbl(
+  .x = deg_list,
+  .f = function(x) {
+    max(x$bayes_factor)
+  }
+) |> max()
+min_bayes <- map_dbl(
+  .x = deg_list,
+  .f = function(x) {
+    min(x$bayes_factor)
+  }
+) |> min()
+
+plots[["volcano_broad"]] <- imap(
+  .x = deg_list,
+  .f = function(x, i) {
+    # big boilerplate energy
+    up_lfc <- x |>
+      filter(lfc_mean > 2) |>
+      pull(gene_name)
+    down_lfc <- x |>
+      filter(lfc_mean < -2) |>
+      pull(gene_name)
+    up_sig_label <- x |>
+      mutate(
+        rank = bayes_factor * lfc_mean
+      ) |>
+      arrange(-rank) |>
+      filter(!str_starts(gene_name, "ENSG")) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+    down_sig_label <- x |>
+      mutate(
+        rank = bayes_factor * lfc_mean
+      ) |>
+      arrange(rank) |>
+      filter(!str_starts(gene_name, "ENSG")) |>
+      slice_head(n = 5) |>
+      pull(gene_name)
+
+    x <- x |>
+      mutate(
+        sig = case_when(
+          gene_name %in% up_lfc & is_de_fdr_0.05 == TRUE ~ "up_sig",
+          gene_name %in% down_lfc & is_de_fdr_0.05 == TRUE ~ "down_sig"
+        )
+      ) |>
+      mutate(
+        colour_point = case_when(
+          sig == "up_sig" ~ "#BC3D41",
+          sig == "down_sig" ~ "#4F7EBB",
+          .default = "grey"
+        )
+      ) |>
+      mutate(
+        label_point = case_when(
+          gene_name %in% c(up_sig_label, down_sig_label) ~ gene_name,
+          .default = NA_character_
+        )
+      )
+
+    if (i == "de_pdn_t") {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDN &rarr;</span>"
+    } else if (i == "de_pdo_t") {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDO &rarr;</span>"
+    }
+
+    library(ggtext)
+    # plot
+    x |>
+      ggplot(
+        aes(
+          x = lfc_mean,
+          y = bayes_factor,
+          colour = colour_point,
+          label = label_point,
+          shape = is_de_fdr_0.05
+        )
+      ) +
+      geom_point(show.legend = FALSE) +
+      scale_colour_identity() +
+      labs(
+        y = "Bayes Factor",
+        x = expression("log"[2] * "FC")
+      ) +
+      theme(
+        aspect.ratio = 1,
+        panel.background = element_rect(fill = NA, colour = "black"),
+        panel.grid = element_line(colour = "grey90"),
+        # plot.title = element_text(hjust = 0.5)
+        plot.title = ggtext::element_markdown(hjust = 0.5)
+      ) +
+      geom_hline(
+        yintercept = x |> filter(is_de_fdr_0.05 == FALSE) |> slice(1) |> pull(bayes_factor),
+        linetype = "dashed"
+      ) +
+      geom_vline(
+        xintercept = c(-2, 2),
+        linetype = "dashed"
+      ) +
+      coord_fixed(clip = "off") +
+      # ggtitle(
+      #   "Up in T Up in PDN"
+      # ) +
+      annotate(
+        label = title_up,
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 1
+      ) +
+      annotate(
+        label = "<span style='color:#4F7EBB;;'> &larr; Up in TIS </span>",
+        geom = "richtext",
+        colour = "white",
+        # label.padding = unit(c(0, 0, 0, 0), "lines"),
+        x = -Inf,
+        y = Inf,
+        vjust = -0.1,
+        hjust = 0
+      ) +
+      labs(title = "", subtitle = "") +
+      lims(
+        x = c(-max_lfc, max_lfc),
+        y = c(min_bayes, max_bayes)
+      ) +
+      ggrepel::geom_label_repel(
+        max.overlaps = 25,
+        force = 2,
+        size = 10 / .pt,
+        fontface = "italic"
+      )
+  }
+)
+
+broad_de_enrich$PDN_TIS$up$GO_Molecular_Function_2018 |> 
+  as_tibble() |> 
+  mutate(count = str_split(Overlap, "/")[[1]][[1]]) |> 
+  ggplot(
+    mapping = aes(
+      x = count,
+      y = Term
+    )
+  )
+
+
+
+rrho <- RRHO2::RRHO2_initialize(
+  list1 = deg_list$de_pdn_t |>
+    # mutate(val = bayes_factor) |>
+    mutate(val = -log10(bayes_factor) * (lfc_mean)) |>
+    # filter(group1 == unique(diff$group1)[1]) |>
+    select(gene_name, val) |>
+    mutate(val = jitter(val)) |>
+    distinct(gene_name, .keep_all = TRUE) |>
+    drop_na() |>
+    as.data.frame(),
+  list2 = deg_list$de_pdo_t |>
+    # mutate(val = bayes_factor) |>
+    mutate(val = -log10(bayes_factor) * (lfc_mean)) |>
+    # filter(group1 == unique(diff$group1)[2]) |>
+    select(gene_name, val) |>
+    mutate(val = jitter(val)) |>
+    distinct(gene_name, .keep_all = TRUE) |>
+    drop_na() |>
+    as.data.frame(),
+  # BY = TRUE,
+  # boundary = 0.1
+  # log10.ind = TRUE,
+  # stepsize = 50,
+  # alternative = "two.sided"
+  # method = "fisher"
+  multipleTesting = "none"
+)
+
+
+plots[["rrho"]] <- rrho$hypermat |>
+  as_tibble() |>
+  rownames_to_column(var = "var1") |>
+  pivot_longer(
+    cols = -var1, names_to = "var2", values_to = "value"
+  ) |>
+  mutate(
+    var1 = factor(var1, levels = 1:ncol(rrho$hypermat)),
+    var2 = factor(gsub("V", "", var2), levels = 1:ncol(rrho$hypermat))
+  ) |>
+  ggplot(
+    mapping =
+      aes(
+        x = var1,
+        y = var2,
+        fill = value
+      )
+  ) +
+  geom_tile() +
+  scale_fill_viridis_c(na.value = "white") +
+  labs(
+    x = "<span style='color:#4F7EBB;'>&larr; Up in TIS</span>
+        <span style='color:#BC3D41;'>Up in PDN &rarr;</span>",
+    y = "<span style='color:#4F7EBB;'>&larr; Up in TIS</span>
+        <span style='color:#BC3D41;'>Up in PDO &rarr;</span>",
+    fill = expression("-log"[10] * "p")
+  ) +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_blank(),
+    axis.title.y = ggtext::element_markdown(vjust = 0.5),
+    axis.title.x = ggtext::element_markdown(hjust = 0.5),
+    axis.ticks = element_blank()
+  )
+
+enrich_broad <- map(
+  .x = deg_list,
+  .f = function(x) {
+    library(enrichR)
+
+    up_genes <- x |>
+      filter(lfc_mean > 0) |>
+      filter(is_de_fdr_0.05 == TRUE) |>
+      pull(gene_name) |>
+      as.character()
+    down_genes <- x |>
+      filter(lfc_mean < 0) |>
+      filter(is_de_fdr_0.05 == TRUE) |>
+      pull(gene_name) |>
+      as.character()
+
+    up_res <- enrichR::enrichr(
+      genes = up_genes,
+      databases = c(
+        "GO_Molecular_Function_2018",
+        "KEGG_2013",
+        "Reactome_2013"
+      )
+    )
+    down_res <- enrichR::enrichr(
+      genes = down_genes,
+      databases = c(
+        "GO_Molecular_Function_2018",
+        "KEGG_2013",
+        "Reactome_2013"
+      )
+    )
+    list(
+      up = up_res,
+      down = down_res
+    )
+  }
+)
+
+plots[["enrich"]] <- imap(
+  .x = enrich_broad,
+  .f = function(x, i) {
+    if (i == "de_pdn_t") {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDN</span>"
+      title_down <- "<span style='color:#4F7EBB;'>Up in TIS</span>"
+    } else if (i == "de_pdo_t") {
+      title_up <- "<span style='color:#BC3D41;'>Up in PDO</span>"
+      title_down <- "<span style='color:#4F7EBB;'>Up in TIS</span>"
+    }
+
+    up_plot <- enrichR::plotEnrich(
+      df = x$up$GO_Molecular_Function_2018,
+      orderBy = "Combined.Score",
+      showTerms = 10
+    ) +
+      scale_fill_viridis_c() +
+      xlab("Gene Count") +
+      guides(fill = guide_colorbar(title = "Score")) +
+      ggtitle(
+        title_up
+      ) +
+      theme(
+        # aspect.ratio = 1,
+        axis.title.y = element_blank(),
+        plot.title = ggtext::element_markdown()
+      )
+    # ggh4x::force_panelsizes(
+    #   rows = unit(5, "cm"),
+    #   cols = unit(10, "cm")
+    # )
+    down_plot <- enrichR::plotEnrich(
+      df = x$down$GO_Molecular_Function_2018,
+      orderBy = "Combined.Score",
+      showTerms = 10
+    ) +
+      scale_fill_viridis_c() +
+      xlab("Gene Count") +
+      guides(fill = guide_colorbar(title = "Score")) +
+      ggtitle(
+        title_down
+      ) +
+      theme(
+        # aspect.ratio = 1,
+        axis.title.y = element_blank(),
+        plot.title = ggtext::element_markdown()
+      )
+    # ggh4x::force_panelsizes(
+    #   rows = unit(5, "cm"),
+    #   cols = unit(10, "cm")
+    # )
+    list(up = up_plot, down = down_plot)
+  }
+)
+```
+
+```{r patchwork}
+patchwork::wrap_plots(
+  patchwork::wrap_plots(
+    plots$mde_all + ggh4x::force_panelsizes(rows = unit(7.5, "cm"), cols = unit(7.5, "cm")),
+    plots$mde_normal + theme(aspect.ratio = 1),
+    patchwork::wrap_plots(
+      plots$mde_mbp + theme(legend.key.height = unit(0.5, "cm")),
+      plots$mde_ptprc + theme(legend.key.height = unit(0.5, "cm")),
+      ncol = 1
+    ),
+    patchwork::wrap_plots(
+      plots$pie_mbp,
+      plots$pie_ptpc,
+      ncol = 1
+    ),
+    ncol = 4
+  ),
+  patchwork::wrap_plots(
+    plots$mde_tumour + theme(aspect.ratio = 1),
+    # patchwork::wrap_plots(
+    plots$bar_anno,
+    plots$ridge_anno,
+    # ncol = 2
+    # ),
+    ncol = 3
+  ),
+  patchwork::wrap_plots(
+    plots$volcano_broad$de_pdn_t,
+    plots$volcano_broad$de_pdo_t,
+    plots$rrho,
+    patchwork::wrap_plots(
+      plots$enrich$de_pdn_t$up,
+      plots$enrich$de_pdo_t$up,
+      ncol = 1
+    ),
+    nrow = 1
+  ),
+  ncol = 1
+) +
+  patchwork::plot_annotation(tag_levels = "A")
+
+ggsave(
+  file = here("figure_2.pdf"),
+  device = cairo_pdf,
+  width = 50,
+  height = 45,
+  units = "cm"
+)
+```

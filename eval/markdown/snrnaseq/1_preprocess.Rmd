@@ -1,0 +1,221 @@
+---
+title: "1_preprocess"
+author: "zm"
+date: "2024-04-30"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+plots <- list()
+```
+
+```{r import}
+# import sce
+sce_list <- map(
+  .progress = TRUE,
+  .x = sample_names,
+  .f = function(x) {
+    sample_dir <- here("data/processed/SCRNA_240430_240621", x, "DGE_filtered")
+    # pre-processed file does NOT have raw counts
+    mat <- Matrix::readMM(
+      file = paste(sample_dir, "count_matrix.mtx", sep = "/")
+    ) |>
+      t()
+    gene_info <- read_csv(
+      file = paste(sample_dir, "all_genes.csv", sep = "/"),
+      show_col_types = FALSE
+    )
+    cell_meta <- read_csv(
+      file = paste(sample_dir, "cell_metadata.csv", sep = "/"),
+      show_col_types = FALSE
+    )
+
+    rownames(mat) <- gene_info$gene_id
+    colnames(mat) <- cell_meta$bc_wells
+
+    # collate
+    sce <- SingleCellExperiment(
+      assays = list(
+        counts = mat
+      ),
+      colData = cell_meta,
+      rowData = gene_info
+    )
+
+    # logcounts and return
+    scuttle::logNormCounts(x = sce)
+  }
+) |>
+  set_names(sample_names)
+
+# sort
+sce_list <- sce_list[sort(names(sce_list))]
+```
+
+```{r ensembl}
+# import annotation
+ensembl <- rtracklayer::import(
+  con = here("meta/genome/Homo_sapiens.GRCh38.109.gtf.gz")
+)
+
+# filter for gene only
+ensembl <- ensembl[ensembl$type == "gene"]
+
+# filter only metadata columns that are gene related
+mcols(ensembl) <- mcols(ensembl) |>
+  as_tibble() |>
+  select(contains(match = "gene")) |>
+  DataFrame()
+
+sce_list <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    # add in extra data
+    rowData(sce) <- rowData(sce) |>
+      as_tibble() |>
+      left_join(
+        y = mcols(ensembl) |>
+          as_tibble(),
+        by = c("gene_id", "gene_name")
+      ) |>
+      DataFrame()
+
+    # return
+    sce
+  }
+)
+```
+
+```{r qc}
+mitochondrial_genes <- ensembl |>
+  subset(seqnames == "MT") |>
+  as_tibble()
+
+mito_threshold <- 10
+detected_threshold <- 250
+
+sce_list <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    # filter for expressed genes
+    # will err otherwise
+    mitochondrial_genes_subset <- mitochondrial_genes |>
+      filter(gene_id %in% row.names(sce)) |>
+      pull(gene_id)
+
+    # add
+    sce <- scuttle::addPerCellQCMetrics(
+      x = sce,
+      subsets = list(mito = mitochondrial_genes_subset)
+    )
+    
+    # reasons
+    reasons <- scuttle::perCellQCFilters(
+      x = sce,
+      sub.fields = c("subsets_mito_percent")
+    )
+
+    # add
+    colData(sce) <- cbind(
+      colData(sce),
+      reasons
+    )
+    # use our threshold instead
+    sce$discard_mito <- sce$subsets_mito_percent > mito_threshold
+    sce$discard_detected <- sce$detected < detected_threshold
+    # or or or
+    sce$discard_final <- 
+      sce$low_n_features | sce$low_lib_size | sce$discard_mito | sce$discard_detected
+
+    # return
+    sce
+  }
+)
+
+plots$qc <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    list(
+      sum = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "sum",
+        colour_by = "discard_final"
+      ) +
+        scale_y_log10() +
+        # theme(aspect.ratio = 2) +
+        theme(plot.title = element_text(face = "plain")) +
+        ggtitle(label = i),
+      detected = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "detected",
+        colour_by = "discard_final"
+      ) +
+        scale_y_log10(),
+      # theme(aspect.ratio = 2),
+      mito = scater::plotColData(
+        object = sce,
+        x = "sample",
+        y = "subsets_mito_percent",
+        colour_by = "discard_final"
+      )
+      # theme(aspect.ratio = 2)
+    ) |>
+      patchwork::wrap_plots(nrow = 1)
+  }
+)
+
+# save
+iwalk(
+  .x = sample_list,
+  .f = function(x, i) {
+    ggsave(
+      filename =
+        here("output/snrnaseq/plots", "1_qc", paste0(i, "_qc.pdf")),
+      plot = plots$qc[x] |>
+        patchwork::wrap_plots(ncol = 1),
+      width = 25,
+      height = 20,
+      units = "cm"
+    )
+  }
+)
+
+# filter
+sce_list <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    sce[, !sce$discard_final]
+  }
+)
+```
+
+```{r save}
+write_rds(
+  x = sce_list,
+  file = here("data/intermed/snrnaseq/1_filtered_sce_list.rds")
+)
+```

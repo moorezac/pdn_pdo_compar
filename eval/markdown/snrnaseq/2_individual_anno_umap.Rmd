@@ -1,0 +1,342 @@
+---
+title: "2_annotation"
+author: "zm"
+date: "2024-06-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+set.seed(42)
+```
+
+```{r here}
+library(here)
+```
+
+```{r libraries}
+library(BiocParallel)
+library(SingleCellExperiment)
+library(tidyverse)
+
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+```{r params}
+source(file = here("eval", "scripts", "r", "params.r"))
+plots <- list()
+```
+
+```{r import}
+sce_list <- read_rds(
+  file = here("data/intermed/snrnaseq/1_filtered_sce_list.rds")
+)
+```
+
+```{r filter}
+`%notin%` <- Negate(f = `%in%`)
+sce_list <- map(
+  .x = sce_list,
+  .f = function(sce) {
+    all_zero <- rownames(sce)[rowSums(counts(sce)) == 0]
+    sce[rownames(sce) %notin% all_zero, ]
+  }
+)
+```
+
+```{r individual_anno}
+# annotation per individual sample
+
+# script to load references
+source(here("eval/scripts/r/load_ref_list.r"))
+
+# start with refs
+# load each reference
+ref_list <- load_ref_list()
+
+# can we avoid nested maps?
+hvgs <- map(
+  .progress = TRUE,
+  .x = list(sce_list, ref_list),
+  .f = function(x) {
+    map(
+      .x = x,
+      .f = function(sce) {
+        scran::modelGeneVar(
+          x = sce,
+          BPPARAM = MulticoreParam(
+            workers = length(parallelly::availableWorkers())
+          )
+        ) |>
+          scran::getTopHVGs(n = 5000)
+      }
+    )
+  }
+)
+names(hvgs) <- c("test", "ref")
+
+# let us generalise
+test_combinations <- crossing(
+  names(sce_list),
+  names(ref_list)
+) |>
+  rename(test = 1, ref = 2)
+
+# justin
+gc()
+
+# could we make this faster?
+# embarrassingly parallel
+individual_anno <- map2(
+  .progress = TRUE,
+  .x = test_combinations$test,
+  .y = test_combinations$ref,
+  .f = function(test, ref) {
+    # extract sce
+    test_sce <- sce_list[[test]]
+    ref_sce <- ref_list[[ref]]
+
+    # common genes between
+    gene_intersect <- intersect(
+      x = rownames(test_sce),
+      y = rownames(ref_sce)
+    )
+
+    # extract hvgs
+    hvgs_test <- hvgs$test[[test]]
+    hvgs_ref <- hvgs$ref[[ref]]
+
+    # common hvgs between
+    hvgs_intersect <- intersect(
+      x = hvgs_test,
+      y = hvgs_ref
+    )
+
+    # column name of labels
+    anno <- case_when(
+      ref == "couturier" ~ "cluster",
+      ref == "ruiz_moreno" ~ "annotation_level_3"
+    )
+
+    # run and return
+    SingleR::SingleR(
+      test = test_sce[gene_intersect, ],
+      ref = ref_sce[gene_intersect, ],
+      restrict = hvgs_intersect,
+      labels = colData(ref_sce)[, anno],
+      de.method = "wilcox",
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    )
+  }
+)
+
+test_combinations <- test_combinations |>
+  mutate(
+    res = map(
+      .x = individual_anno,
+      .f = as_tibble, rownames = "barcode"
+    )
+  )
+
+write_rds(
+  x = test_combinations,
+  file = here("data/intermed/snrnaseq/2_individual_anno_res.rds")
+)
+```
+
+```{r individual_umap}
+# use calculated hvgs if available
+if (!exists("hvgs")) {
+  hvgs <- list()
+  hvgs[["test"]] <- map(
+    .progress = TRUE,
+    .x = sce_list,
+    .f = function(sce) {
+      scran::modelGeneVar(
+        x = sce,
+        BPPARAM = MulticoreParam(
+          workers = length(parallelly::availableWorkers())
+        )
+      ) |>
+        scran::getTopHVGs(n = 5000)
+    }
+  )
+}
+
+# should parallelize this? how to make faster??
+sce_list <- imap(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce, i) {
+    # default calc is 50
+    set.seed(42)
+    # why does this hang if performed any other way??
+    reducedDim(sce, "PCA") <- scater::calculatePCA(
+      x = logcounts(sce)[hvgs$test[[i]], ],
+      ntop = length(hvgs$test[[i]]),
+      BSPARAM = BiocSingular::IrlbaParam()
+    )
+    
+    # estimate dims
+    dim_est <- intrinsicDimension::maxLikGlobalDimEst(
+      data = reducedDims(sce)$PCA,
+      k = 50,
+      unbiased = TRUE
+    ) |>
+      unlist() |>
+      unname() |>
+      round()
+
+    # this will (always) be lower than 50
+    # redundant? just call runPCA with dim_est?
+    # print(dim_est)
+    max_dims <- min(50, dim_est)
+
+    # modify in place
+    reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[, 1:max_dims]
+
+    # umap and return
+    scater::runUMAP(
+      x = sce,
+      dimred = "PCA",
+      ncomponents = max_dims,
+      n_neighbors = 15,
+      spread = 3,
+      min_dist = 0.05
+      # BPPARAM = MulticoreParam(
+      #   workers = length(parallelly::availableWorkers())
+      # )
+    )
+  }
+)
+```
+
+```{r add}
+sce_list <- imap(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce, i) {
+    # sort and extract
+    index <- which(test_combinations$test == i)
+    pruned_label <- test_combinations$res[[index]] |>
+      arrange(match(barcode, colnames(sce))) |>
+      pull(pruned.labels)
+
+    # add in
+    sce$individual_anno <- pruned_label
+
+    # return
+    sce
+  }
+)
+```
+
+```{r visualise}
+plots$individual_umap <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    scater::plotReducedDim(
+      object = sce,
+      dimred = "UMAP",
+      color_by = "individual_anno"
+    ) +
+      ggtitle(label = i) +
+      theme(aspect.ratio = 1)
+  }
+)
+```
+
+```{r cyclone}
+cycle_pairs <- read_rds(
+  file = system.file("exdata", "human_cycle_markers.rds", package = "scran")
+)
+
+cyclone_scores <- map(
+  .progress = TRUE,
+  .x = sce_list,
+  .f = function(sce) {
+    scran::cyclone(
+      x = counts(sce),
+      pairs = cycle_pairs,
+      BPPARAM = MulticoreParam(
+        workers = length(parallelly::availableWorkers())
+      )
+    )
+  }
+)
+
+sce_list <- imap(
+  .x = sce_list,
+  .f = function(sce, i) {
+    sce$score_g1 <- cyclone_scores[[i]]$normalized.scores$G1
+    sce$score_g2m <- cyclone_scores[[i]]$normalized.scores$G2M
+    sce$score_s <- cyclone_scores[[i]]$normalized.scores$S
+
+    sce
+  }
+)
+
+write_rds(
+  x = cyclone_scores,
+  file = here("data/intermed/snrnaseq/2_cyclone_all.rds")
+)
+```
+
+```{r combine}
+# easiest method is this
+sce_original <- read_rds(
+  file = here("data/intermed/snrnaseq/1_filtered_sce_list.rds")
+)
+
+sce_line_list <- map(
+  .progress = TRUE,
+  .x = unique(sample_groups),
+  .f = function(x) {
+    # retrieve indexes from list
+    index <- str_detect(
+      string = names(sce_list),
+      pattern = x
+    )
+
+    # filter
+    sce_list_filt <- sce_original[index]
+
+    # no bueno
+    sce_list_filt <- imap(
+      .x = sce_list_filt,
+      .f = function(sce, i) {
+        # remove dims
+        reducedDim(sce, "PCA") <- NULL
+        reducedDim(sce, "UMAP") <- NULL
+        # add col. data
+        colData(sce) <- colData(sce_list[[i]])
+        sce
+      }
+    )
+    
+    # combine and return
+    purrr::reduce(
+      .x = sce_list_filt,
+      .f = cbind
+    )
+  }
+)
+names(sce_line_list) <- unique(sample_groups)
+```
+
+```{r save}
+write_rds(
+  x = sce_list,
+  file = here("data/intermed/snrnaseq/2_sce_list.rds")
+)
+
+write_rds(
+  x = sce_line_list,
+  file = here("data/intermed/snrnaseq/2_sce_line_list.rds")
+)
+```
