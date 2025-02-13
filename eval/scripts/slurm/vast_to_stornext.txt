@@ -1,35 +1,0 @@
-sending incremental file list
-markdown/
-markdown/figure_2.Rmd
-         26,204 100%    0.00kB/s    0:00:00           26,204 100%    0.00kB/s    0:00:00 (xfr#1, to-chk=55/60)
-markdown/figure_3.Rmd
-         30,604 100%   29.19MB/s    0:00:00           30,604 100%   29.19MB/s    0:00:00 (xfr#2, to-chk=54/60)
-markdown/meth/1_meth_new.Rmd
-         19,420 100%    2.65MB/s    0:00:00           19,420 100%    2.65MB/s    0:00:00 (xfr#3, to-chk=47/60)
-markdown/snp/1_snp_new.Rmd
-         28,363 100%    1.69MB/s    0:00:00           28,363 100%    1.69MB/s    0:00:00 (xfr#4, to-chk=44/60)
-markdown/snrnaseq/
-markdown/snrnaseq/1_preprocess_seurat.Rmd
-         32,768  94%    1.84MB/s    0:00:00           34,616 100%    1.83MB/s    0:00:00 (xfr#5, to-chk=43/60)
-markdown/snrnaseq/plots.Rmd
-         32,768  45%    1.49MB/s    0:00:00           72,424 100%    3.29MB/s    0:00:00 (xfr#6, to-chk=42/60)
-old/6t_plots.R
-         18,583 100%  789.02kB/s    0:00:00           18,583 100%  789.02kB/s    0:00:00 (xfr#7, to-chk=40/60)
-old/incu.R
-          2,653 100%  107.95kB/s    0:00:00            2,653 100%  107.95kB/s    0:00:00 (xfr#8, to-chk=33/60)
-scripts/
-scripts/python/
-scripts/python/1_scvi_all-Copy1.ipynb
-         32,768   4%    1.25MB/s    0:00:00          704,575 100%   10.18MB/s    0:00:00 (xfr#9, to-chk=24/60)
-scripts/python/1_scvi_all-Copy2.ipynb
-         32,768   0%  477.61kB/s    0:00:07        3,406,276 100%   30.36MB/s    0:00:00 (xfr#10, to-chk=23/60)
-scripts/python/.ipynb_checkpoints/
-scripts/python/.ipynb_checkpoints/1_scvi_all-Copy1-checkpoint.ipynb
-         32,768  61%  296.30kB/s    0:00:00           53,386 100%  482.73kB/s    0:00:00 (xfr#11, to-chk=19/60)
-scripts/r/growth.R
-          7,331 100%   65.68kB/s    0:00:00            7,331 100%   65.68kB/s    0:00:00 (xfr#12, to-chk=13/60)
-scripts/r/params_new.r
-          1,853 100%   16.60kB/s    0:00:00            1,853 100%   16.60kB/s    0:00:00 (xfr#13, to-chk=7/60)
-scripts/slurm/
-scripts/slurm/check_time.r
-            691 100%    6.13kB/s    0:00:00              691 100%    6.13kB/s    0:00:00 (xfr#14, to-chk=2/60)
